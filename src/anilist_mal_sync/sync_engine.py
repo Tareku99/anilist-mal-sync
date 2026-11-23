@@ -76,6 +76,28 @@ class SyncEngine:
 
         return False
 
+    def _resolve_anilist_id(self, entry: AnimeEntry) -> bool:
+        """Resolve an AniList ID for an entry by searching its title."""
+        if entry.anilist_id:
+            return True
+        if not isinstance(self.anilist, AniListClient):
+            return False
+
+        matches = self.anilist.search_anime(entry.title, limit=3)
+        match_id = None
+        for match in matches:
+            titles = [match.get("title", {}).get(key) for key in ["romaji", "english", "native"]]
+            if any(title and title.lower() == entry.title.lower() for title in titles):
+                match_id = match.get("id")
+                break
+        if not match_id and matches:
+            match_id = matches[0].get("id")
+
+        if match_id:
+            entry.anilist_id = match_id
+            return True
+        return False
+
     def sync(
         self, mode: Literal["anilist-to-mal", "mal-to-anilist", "bidirectional"]
     ) -> SyncResult:
@@ -146,25 +168,10 @@ class SyncEngine:
                         logger.debug(f"  -> Will update (changes detected)")
 
                 # If syncing MAL -> AniList, resolve AniList ID when missing
-                if target == "anilist" and not entry.anilist_id:
-                    if isinstance(self.anilist, AniListClient):
-                        matches = self.anilist.search_anime(entry.title, limit=3)
-                        match_id = None
-                        for m in matches:
-                            # Prefer exact case-insensitive title match
-                            titles = [m.get("title", {}).get(k) for k in ["romaji", "english", "native"]]
-                            if any(t and t.lower() == entry.title.lower() for t in titles):
-                                match_id = m.get("id")
-                                break
-                        if not match_id and matches:
-                            match_id = matches[0].get("id")
-
-                        if match_id:
-                            entry.anilist_id = match_id
-                        else:
-                            summary["skipped_not_found"] += 1
-                            logger.warning(f"No AniList match found for MAL entry: {self._safe_title(entry.title)}")
-                            continue
+                if target == "anilist" and not self._resolve_anilist_id(entry):
+                    summary["skipped_not_found"] += 1
+                    logger.warning(f"No AniList match found for MAL entry: {self._safe_title(entry.title)}")
+                    continue
                 
                 # Check if update is needed for MAL -> AniList (after resolving ID)
                 elif target == "anilist" and entry.anilist_id:
@@ -236,16 +243,25 @@ class SyncEngine:
                     result.entries_synced += 1
 
                 elif mal_entry and not anilist_entry:
-                    # Only on MAL, add to AniList
+                    # Only on MAL, resolve the AniList ID and add the entry
+                    if not self._resolve_anilist_id(mal_entry):
+                        logger.warning(
+                            f"No AniList match found for MAL entry: {self._safe_title(mal_entry.title)}"
+                        )
+                        continue
+
                     if self.dry_run:
                         logger.info(f"[DRY RUN] Would add to AniList: {self._safe_title(mal_entry.title)}")
+                        result.entries_synced += 1
+                    elif self.anilist.update_anime(mal_entry):
+                        result.entries_synced += 1
                     else:
-                        self.anilist.update_anime(mal_entry)
-                    result.entries_synced += 1
+                        result.entries_failed += 1
+                        result.errors.append(f"Failed to add to AniList: {mal_entry.title}")
 
                 elif anilist_entry and mal_entry:
                     # On both, resolve conflicts
-                    if self._resolve_conflict(anilist_entry, mal_entry):
+                    if self._resolve_conflict(anilist_entry, mal_entry, settings.score_sync_mode):
                         result.entries_synced += 1
                     else:
                         result.entries_failed += 1
@@ -259,14 +275,27 @@ class SyncEngine:
         result.success = result.entries_failed == 0
         return result
 
-    def _resolve_conflict(self, anilist_entry: AnimeEntry, mal_entry: AnimeEntry) -> bool:
+    def _resolve_conflict(
+        self,
+        anilist_entry: AnimeEntry,
+        mal_entry: AnimeEntry,
+        score_sync_mode: str = "auto",
+    ) -> bool:
         """Resolve conflicts between AniList and MAL entries (latest update wins).
         
         Returns:
             bool: True if sync was successful or no sync needed, False if sync failed.
         """
-        # Use timestamps to determine which entry is newer
+        # Skip writes when timestamps differ but syncable fields are already equal.
         if anilist_entry.updated_at and mal_entry.updated_at:
+            if not self._needs_update(anilist_entry, mal_entry, score_sync_mode):
+                logger.debug(
+                    f"No syncable differences for {self._safe_title(anilist_entry.title)} "
+                    "despite different update times"
+                )
+                return True
+
+            # Use timestamps to determine which entry is newer
             if anilist_entry.updated_at > mal_entry.updated_at:
                 logger.debug(
                     f"AniList has newer update for {self._safe_title(anilist_entry.title)} "
