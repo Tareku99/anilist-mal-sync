@@ -407,14 +407,15 @@ src/anilist_mal_sync/
 
 ## Contributing
 
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+See the [shared contribution guidelines](https://github.com/Tareku99/.github/blob/main/CONTRIBUTING.md). If you change CLI commands, sync behavior, authentication, configuration validation, or error handling, update the corresponding diagram in [How It Works](#how-it-works).
 
 ## Additional Resources
 
 - **[Support and reporting](https://github.com/Tareku99/.github/blob/main/SUPPORT.md)** - Get help and support
 - **[Troubleshooting](docs/troubleshooting.md)** - OAuth, synchronization, and configuration
-- **[SECURITY.md](SECURITY.md)** - Security policy and vulnerability reporting
-- **[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)** - Community guidelines
+- **[Report a vulnerability](https://github.com/Tareku99/.github/blob/main/SECURITY.md)** - Shared private reporting instructions
+- **[Deployment security](docs/deployment-security.md)** - AniList-specific guidance for credentials, volumes, and network access
+- **[Code of conduct](https://github.com/Tareku99/.github/blob/main/CODE_OF_CONDUCT.md)** - Community guidelines
 - **[LICENSE](LICENSE)** - MIT License
 
 ## Support the Project
