@@ -66,7 +66,7 @@ docker compose up -d
 
 ### 3. Configure
 
-The container creates `data/config.yaml` on first run. You can edit it through the **Web UI** at `http://YOUR-SERVER-IP:23080` (recommended) or directly on the filesystem:
+The container creates `data/config.yaml` on first run. Edit that file on the host and fill in your credentials before opening the web UI. The service waits for valid credentials before starting the dashboard.
 
 ```bash
 nano data/config.yaml  # Or your preferred editor
@@ -100,7 +100,7 @@ sync:
 # token_file_path: "/app/data/tokens.json"                   # OPTIONAL - has default
 ```
 
-Restart: `docker compose restart` (or wait 60s for auto-reload)
+Run `docker compose restart` so the container reads the new credentials. On Unraid, restart it from the Docker tab.
 
 ### 4. Authenticate
 
