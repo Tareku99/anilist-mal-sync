@@ -1,31 +1,56 @@
 name: Docker Release
-run-name: "${{ github.event_name == 'pull_request' && format('PR #{0} • {1}', github.event.number, github.head_ref) || format('{0} • {1}', github.event_name, github.ref_name) }}"
+run-name: "${{ github.event_name == 'workflow_dispatch' && format('Beta • {0}', inputs.branch) || github.event_name == 'pull_request' && format('PR #{0} • {1}', github.event.number, github.head_ref) || format('Production • {0}', github.ref_name) }}"
 
 on:
-  push:
-    branches:
-      - main
-    tags:
-      - v*
   pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
   workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch to publish as beta (run this workflow from main)
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: docker-${{ github.event.pull_request.number || github.ref }}
+  group: docker-release-${{ github.event.pull_request.number || (github.event_name == 'workflow_dispatch' && 'beta') || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
     name: test
     runs-on: ubuntu-24.04
-    permissions:
-      contents: read
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+      - name: Validate beta branch
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          BETA_BRANCH: ${{ inputs.branch }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]]; then
+            echo "::error::Run this workflow from the default branch and enter the beta branch as an input."
+            exit 1
+          fi
+          git check-ref-format "refs/heads/$BETA_BRANCH"
+
+      - name: Check out application source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/heads/{0}', inputs.branch) || github.sha }}
+          persist-credentials: false
+
+      - name: Record source commit
+        id: source
+        shell: bash
+        run: printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -44,11 +69,13 @@ jobs:
       - name: Add test summary
         if: always()
         env:
+          BETA_BRANCH: ${{ inputs.branch }}
           TEST_OUTCOME: ${{ steps.test.outcome }}
           HEAD_REF: ${{ github.head_ref }}
         run: |
           python - <<'PY'
           import os
+          import subprocess
           import xml.etree.ElementTree as ET
 
           counts = {}
@@ -72,8 +99,8 @@ jobs:
           }.get(outcome, "⚪ Not run")
           repo = os.environ["GITHUB_REPOSITORY"]
           server = os.environ["GITHUB_SERVER_URL"]
-          sha = os.environ["GITHUB_SHA"]
-          ref = os.environ.get("HEAD_REF") or os.environ["GITHUB_REF_NAME"]
+          sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          ref = os.environ.get("BETA_BRANCH") or os.environ.get("HEAD_REF") or os.environ["GITHUB_REF_NAME"]
           rows = [
               "## Test results",
               "",
@@ -103,65 +130,24 @@ jobs:
     if: github.event_name == 'pull_request'
     permissions:
       contents: read
-    uses: Tareku99/shared-devops/.github/workflows/docker-build.yml@6a608704827d1d8a3596811b7f8c0e79b5d7c71c
+    uses: Tareku99/shared-devops/.github/workflows/docker-build.yml@a9d2beb9f2c0015f3ca455c0a21b01a869949eb2
     with:
       image: ghcr.io/tareku99/anilist-mal-sync
-      source_image: anilist-mal-sync:ci-${{ github.run_id }}-${{ github.run_attempt }}
-
-  prepare-tags:
-    name: prepare-tags
-    needs: test
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-    outputs:
-      tags: ${{ steps.meta.outputs.tags }}
-    steps:
-      - name: Compute image tags
-        id: meta
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
-            tag_list="$(printf 'beta\nbeta-%s' "${GITHUB_SHA:0:12}")"
-          else
-            {
-              if [[ "$GITHUB_REF" == refs/heads/main ]]; then
-                printf '%s\n' latest
-                printf '%s\n' main
-              else
-                printf '%s\n' latest
-                printf '%s\n' "$GITHUB_REF_NAME"
-              fi
-              printf 'sha-%s\n' "${GITHUB_SHA:0:7}"
-            } | awk 'NF && !seen[$0]++' > "$RUNNER_TEMP/anilist-image-tags.txt"
-            tag_list="$(cat "$RUNNER_TEMP/anilist-image-tags.txt")"
-          fi
-          delimiter="ANILIST_TAGS_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
-          {
-            printf 'tags<<%s\n' "$delimiter"
-            printf '%s\n' "$tag_list"
-            printf '%s\n' "$delimiter"
-          } >> "$GITHUB_OUTPUT"
+      source_image: local-build:ci-${{ github.run_id }}-${{ github.run_attempt }}
 
   publish:
     name: publish
-    needs: [test, prepare-tags]
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+    needs: test
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     permissions:
       contents: read
       packages: write
-    uses: Tareku99/shared-devops/.github/workflows/docker-publish.yml@6a608704827d1d8a3596811b7f8c0e79b5d7c71c
+    uses: Tareku99/shared-devops/.github/workflows/docker-publish.yml@a9d2beb9f2c0015f3ca455c0a21b01a869949eb2
     with:
       image: ghcr.io/tareku99/anilist-mal-sync
-      source_image: anilist-mal-sync:ci-${{ github.run_id }}-${{ github.run_attempt }}
-      tags: ${{ needs.prepare-tags.outputs.tags }}
+      source_image: local-build:ci-${{ github.run_id }}-${{ github.run_attempt }}
+      source_sha: ${{ needs.test.outputs.source_sha }}
+      beta_branch: ${{ inputs.branch || '' }}
+      include_sha_tag: true
     secrets:
       ghcr_token: ${{ secrets.GITHUB_TOKEN }}
