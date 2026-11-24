@@ -411,7 +411,8 @@ Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for gui
 
 ## Additional Resources
 
-- **[SUPPORT.md](SUPPORT.md)** - Get help and support
+- **[Support and reporting](https://github.com/Tareku99/.github/blob/main/SUPPORT.md)** - Get help and support
+- **[Troubleshooting](docs/troubleshooting.md)** - OAuth, synchronization, and configuration
 - **[SECURITY.md](SECURITY.md)** - Security policy and vulnerability reporting
 - **[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)** - Community guidelines
 - **[LICENSE](LICENSE)** - MIT License

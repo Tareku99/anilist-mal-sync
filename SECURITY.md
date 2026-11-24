@@ -11,12 +11,13 @@ We actively support security updates for the following versions:
 
 ## Reporting a Vulnerability
 
+See also the [shared reporting policy](https://github.com/Tareku99/.github/blob/main/SECURITY.md).
+
 If you discover a security vulnerability in AniList-MAL Sync, please **do not** open a public issue. Security vulnerabilities could affect users' OAuth tokens, API credentials, or personal anime list data.
 
 Please report it privately using one of these methods:
 
 1. **GitHub Security Advisory** (Preferred): Use GitHub's [Private Vulnerability Reporting](https://github.com/Tareku99/anilist-mal-sync/security/advisories/new) feature
-2. **Private Issue**: Open a GitHub issue with the `[SECURITY]` label - maintainers will make it private
 
 ### What to Include
 
