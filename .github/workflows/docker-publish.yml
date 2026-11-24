@@ -108,7 +108,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build image for PR validation
-        uses: Tareku99/shared-devops/.github/actions/docker-release@3360885d29d84da4ab35f868832708ff51fb6960
+        uses: Tareku99/shared-devops/.github/actions/docker-release@3cc3ffbd30f55a40dfcf812ff2d378b4913d5180
         with:
           image: ghcr.io/tareku99/anilist-mal-sync
           source_image: anilist-mal-sync:ci-${{ github.run_id }}-${{ github.run_attempt }}
@@ -157,7 +157,7 @@ jobs:
 
       - name: Build and publish tested image
         id: build
-        uses: Tareku99/shared-devops/.github/actions/docker-release@3360885d29d84da4ab35f868832708ff51fb6960
+        uses: Tareku99/shared-devops/.github/actions/docker-release@3cc3ffbd30f55a40dfcf812ff2d378b4913d5180
         with:
           image: ghcr.io/tareku99/anilist-mal-sync
           source_image: anilist-mal-sync:ci-${{ github.run_id }}-${{ github.run_attempt }}
