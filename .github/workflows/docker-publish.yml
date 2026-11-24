@@ -1,35 +1,39 @@
-name: Build and Push Docker Image
+name: Test and Publish Docker Image
+run-name: "${{ github.event_name }} • ${{ github.ref_name }}"
 
 on:
-  # Build when merging to main (push to main)
   push:
-    branches: [main]
-  # Also allow manual run from Actions tab
+    branches:
+      - "**"
+  pull_request:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Optional tag to create (e.g., v1.0.0)'
+        description: "Optional tag to create (e.g., v1.0.0)"
         required: false
         type: string
+
+permissions:
+  contents: read
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build-and-push:
+  tests:
+    name: Test suite
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
-
     steps:
-      - name: Checkout repository
+      - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
@@ -37,8 +41,77 @@ jobs:
           pip install -e ".[dev]"
 
       - name: Run tests
+        id: test
+        run: pytest tests/ -v --junitxml=test-results.xml
+
+      - name: Add test summary
+        if: always()
+        env:
+          TEST_OUTCOME: ${{ steps.test.outcome }}
         run: |
-          pytest tests/ -v
+          python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          counts = {}
+          try:
+              root = ET.parse("test-results.xml").getroot()
+              suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+              for key in ("tests", "failures", "errors", "skipped"):
+                  counts[key] = sum(int(suite.get(key, "0")) for suite in suites)
+              counts["passed"] = (
+                  counts["tests"] - counts["failures"] - counts["errors"] - counts["skipped"]
+              )
+          except (OSError, ET.ParseError):
+              pass
+
+          outcome = os.environ.get("TEST_OUTCOME", "not run")
+          result = {
+              "success": "✅ Passed",
+              "failure": "❌ Failed",
+              "cancelled": "⚪ Cancelled",
+              "skipped": "⏭️ Skipped",
+          }.get(outcome, "⚪ Not run")
+          repo = os.environ["GITHUB_REPOSITORY"]
+          server = os.environ["GITHUB_SERVER_URL"]
+          sha = os.environ["GITHUB_SHA"]
+          rows = [
+              "## Test results",
+              "",
+              "| Item | Result |",
+              "| --- | --- |",
+              f"| Test suite | {result} |",
+              f"| Total tests | {counts.get('tests', 'Unavailable')} |",
+              f"| Passed | {counts.get('passed', 'Unavailable')} |",
+              f"| Failed | {counts.get('failures', 'Unavailable')} |",
+              f"| Errors | {counts.get('errors', 'Unavailable')} |",
+              f"| Skipped | {counts.get('skipped', 'Unavailable')} |",
+              f"| Python | 3.11 |",
+              f"| Trigger | {os.environ['GITHUB_EVENT_NAME']} |",
+              f"| Ref | {os.environ['GITHUB_REF_NAME']} |",
+              f"| Commit | [`{sha[:7]}`]({server}/{repo}/commit/{sha}) |",
+              "",
+              "The Docker image is published only after this test job succeeds, on pushes to `main` or a manual workflow run.",
+              "",
+          ]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("\n".join(rows))
+          PY
+
+  build-and-push:
+    name: Build and push GHCR image
+    needs: tests
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
 
       - name: Log in to Container Registry
         uses: docker/login-action@v3
@@ -47,7 +120,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
+      - name: Extract image metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -59,9 +132,49 @@ jobs:
             type=sha,short=true
 
       - name: Build and push Docker image
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Add image summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          python - <<'PY'
+          import os
+
+          tags = [tag for tag in os.environ.get("IMAGE_TAGS", "").splitlines() if tag]
+          outcome = os.environ.get("BUILD_OUTCOME") or "not run"
+          digest = os.environ.get("IMAGE_DIGEST") or "Not available"
+          repo = os.environ["GITHUB_REPOSITORY"]
+          server = os.environ["GITHUB_SERVER_URL"]
+          sha = os.environ["GITHUB_SHA"]
+          rows = [
+              "## Docker image build",
+              "",
+              "| Item | Result |",
+              "| --- | --- |",
+              f"| Job | {os.environ['JOB_STATUS']} |",
+              f"| Build and push step | {outcome} |",
+              f"| Image | [`{os.environ['REGISTRY']}/{repo}`]({server}/{repo}/pkgs/container/anilist-mal-sync) |",
+              f"| Digest | `{digest}` |",
+              f"| Commit | [`{sha[:7]}`]({server}/{repo}/commit/{sha}) |",
+              "",
+              "### Published tags",
+              "",
+          ]
+          rows.extend(f"- `{tag}`" for tag in tags)
+          if not tags:
+              rows.append("- No tags were produced.")
+          rows.append("")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("\n".join(rows))
+          PY
