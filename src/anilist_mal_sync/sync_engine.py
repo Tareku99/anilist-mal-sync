@@ -97,6 +97,14 @@ class SyncEngine:
 
         if match_id is None:
             for match in matches:
+                match_mal_id = match.get("idMal")
+                if (
+                    entry.mal_id is not None
+                    and match_mal_id is not None
+                    and match_mal_id != entry.mal_id
+                ):
+                    continue
+
                 titles = [match.get("title", {}).get(key) for key in ("romaji", "english", "native")]
                 if any(title and title.casefold() == entry.title.casefold() for title in titles):
                     match_id = match.get("id")
