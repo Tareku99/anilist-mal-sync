@@ -1,24 +1,27 @@
-name: Test and Publish Docker Image
+name: Docker Release
 run-name: "${{ github.event_name == 'pull_request' && format('PR #{0} • {1}', github.event.number, github.head_ref) || format('{0} • {1}', github.event_name, github.ref_name) }}"
 
 on:
   push:
     branches:
       - main
+    tags:
+      - v*
   pull_request:
+    branches:
+      - main
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Optional tag to create (e.g., v1.0.0)"
-        required: false
-        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: docker-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  tests:
-    name: Test suite
+  test:
+    name: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -84,12 +87,12 @@ jobs:
               f"| Failed | {counts.get('failures', 'Unavailable')} |",
               f"| Errors | {counts.get('errors', 'Unavailable')} |",
               f"| Skipped | {counts.get('skipped', 'Unavailable')} |",
-              f"| Python | 3.11 |",
+              "| Python | 3.11 |",
               f"| Trigger | {os.environ['GITHUB_EVENT_NAME']} |",
               f"| Ref | {ref} |",
               f"| Commit | [`{sha[:7]}`]({server}/{repo}/commit/{sha}) |",
               "",
-              "The Docker image is published only after this test job succeeds, on pushes to `main` or a manual workflow run.",
+              "Production images publish after tests on pushes to `main` or version tags. A manual run publishes the selected branch as `beta`.",
               "",
           ]
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
@@ -98,7 +101,7 @@ jobs:
 
   build:
     name: build
-    needs: tests
+    needs: test
     if: github.event_name == 'pull_request'
     permissions:
       contents: read
@@ -108,54 +111,52 @@ jobs:
       source_image: anilist-mal-sync:ci-${{ github.run_id }}-${{ github.run_attempt }}
 
   prepare-tags:
-    name: prepare image tags
-    needs: tests
+    name: prepare-tags
+    needs: test
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
       tags: ${{ steps.meta.outputs.tags }}
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
       - name: Compute image tags
         id: meta
-        env:
-          INPUT_TAG: ${{ inputs.tag }}
+        shell: bash
         run: |
           set -euo pipefail
-          tag_file="$RUNNER_TEMP/anilist-image-tags.txt"
-          {
-            if [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
-              printf '%s\n' latest
-            fi
-            if [[ "$GITHUB_REF" == refs/heads/* ]]; then
-              branch="${GITHUB_REF#refs/heads/}"
-              branch="$(printf '%s' "$branch" | sed -E 's/[^A-Za-z0-9_.-]+/-/g')"
-              printf '%s\n' "$branch"
-            fi
-            if [[ -n "$INPUT_TAG" ]]; then
-              printf '%s\n' "$INPUT_TAG"
-            fi
-            printf 'sha-%s\n' "${GITHUB_SHA:0:7}"
-          } | awk 'NF && !seen[$0]++' > "$tag_file"
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            tag_list="$(printf 'beta\nbeta-%s' "${GITHUB_SHA:0:12}")"
+          else
+            {
+              if [[ "$GITHUB_REF" == refs/heads/main ]]; then
+                printf '%s\n' latest
+                printf '%s\n' main
+              else
+                printf '%s\n' latest
+                printf '%s\n' "$GITHUB_REF_NAME"
+              fi
+              printf 'sha-%s\n' "${GITHUB_SHA:0:7}"
+            } | awk 'NF && !seen[$0]++' > "$RUNNER_TEMP/anilist-image-tags.txt"
+            tag_list="$(cat "$RUNNER_TEMP/anilist-image-tags.txt")"
+          fi
           delimiter="ANILIST_TAGS_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
           {
             printf 'tags<<%s\n' "$delimiter"
-            cat "$tag_file"
+            printf '%s\n' "$tag_list"
             printf '%s\n' "$delimiter"
           } >> "$GITHUB_OUTPUT"
 
-  build-and-push:
-    name: Build and push GHCR image
-    needs: [tests, prepare-tags]
+  publish:
+    name: publish
+    needs: [test, prepare-tags]
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
     permissions:
       contents: read
       packages: write
