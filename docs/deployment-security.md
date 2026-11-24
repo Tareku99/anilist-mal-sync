@@ -1,42 +1,10 @@
-# Security Policy
+# AniList-MAL Sync deployment security
 
-## Supported Versions
+Use the [shared security policy](https://github.com/Tareku99/.github/blob/main/SECURITY.md) for private vulnerability reporting.
 
-We actively support security updates for the following versions:
+Security patches are released for the latest version. Follow the [repository advisories](https://github.com/Tareku99/anilist-mal-sync/security/advisories) and releases for updates.
 
-| Version | Supported          |
-| ------- | ------------------ |
-| Latest  | :white_check_mark: |
-| < Latest| :x:                |
-
-## Reporting a Vulnerability
-
-If you discover a security vulnerability in AniList-MAL Sync, please **do not** open a public issue. Security vulnerabilities could affect users' OAuth tokens, API credentials, or personal anime list data.
-
-Please report it privately using one of these methods:
-
-1. **GitHub Security Advisory** (Preferred): Use GitHub's [Private Vulnerability Reporting](https://github.com/Tareku99/anilist-mal-sync/security/advisories/new) feature
-2. **Private Issue**: Open a GitHub issue with the `[SECURITY]` label - maintainers will make it private
-
-### What to Include
-
-When reporting a vulnerability, please include:
-
-- **Description**: Clear description of the security issue
-- **Affected Components**: Which part of the system is affected (OAuth flow, token storage, API clients, config handling, etc.)
-- **Steps to Reproduce**: Detailed steps to reproduce the vulnerability
-- **Potential Impact**: What could an attacker do? (e.g., access tokens, modify lists, steal credentials)
-- **Severity**: Your assessment of severity (Critical, High, Medium, Low)
-- **Suggested Fix**: If you have ideas for how to fix it
-- **Proof of Concept**: If applicable, a minimal example demonstrating the issue (be careful not to include real credentials)
-
-### Response Timeline
-
-- **Initial Response**: Within 48 hours
-- **Status Update**: Within 7 days
-- **Resolution**: Depends on severity and complexity
-
-### Security Best Practices for AniList-MAL Sync
+## Deployment practices
 
 When deploying or using this project:
 
@@ -71,9 +39,9 @@ When deploying or using this project:
    - The OAuth callback port (18080) should only be accessible during initial setup
    - Consider firewall rules to restrict access to the OAuth callback port
 
-### Known Security Considerations
+## Security considerations
 
-#### OAuth Token Storage
+### OAuth Token Storage
 - **Location**: Tokens are stored in `data/tokens.json` in JSON format
 - **Contents**: Contains `access_token`, `refresh_token` (MAL only), and `expires_at` for both AniList and MyAnimeList
 - **Permissions**: Set file permissions to `600` (owner read/write only)
@@ -82,38 +50,30 @@ When deploying or using this project:
   - MyAnimeList tokens expire after 31 days (auto-refreshed)
   - AniList tokens expire after 1 year (manual re-auth required)
 
-#### Configuration File Security
+### Configuration File Security
 - **Location**: `data/config.yaml` contains all API credentials
 - **Contents**: AniList and MyAnimeList client IDs, client secrets, usernames, and OAuth settings
 - **Permissions**: Set file permissions to `600`
 - **Environment Variables**: Consider using environment variables for sensitive values (see `config.py` for supported env vars)
 
-#### OAuth Flow Security
+### OAuth Flow Security
 - **Callback Port**: Default OAuth callback port is `18080` - ensure this is not publicly accessible after initial setup
 - **Redirect URI Validation**: Both AniList and MyAnimeList validate redirect URIs - they must match exactly
 - **Token Scope**: The application requests minimal necessary permissions (read/write anime list data only)
 
-#### API Communication
+### API Communication
 - **HTTPS Required**: All API communication uses HTTPS (AniList GraphQL, MyAnimeList REST)
 - **Rate Limiting**: The application implements rate limiting and retry logic to respect API limits
 - **No Data Storage**: The application does not store your anime list data - it only syncs between services
 
-#### Docker Deployment
+### Docker Deployment
 - **Volume Mounts**: The `data/` directory is mounted as a volume - ensure host permissions are secure
 - **Network**: Container needs outbound HTTPS access to `anilist.co` and `myanimelist.net`
 - **Ports**: 
    - `23080` (web UI) - consider restricting access
   - `18080` (OAuth callback) - should only be accessible during setup
 
-#### Web UI Security
+### Web UI Security
 - **No Authentication**: The web UI (port 23080) currently has no authentication - restrict network access
 - **Local Access Only**: Recommended to only expose on localhost or use a reverse proxy with authentication
 - **Configuration Editing**: The web UI can edit `config.yaml` - ensure proper access controls
-
-## Security Updates
-
-Security updates will be released as patches to the latest version. We recommend:
-
-- Regularly updating to the latest version
-- Monitoring the repository for security advisories
-- Subscribing to release notifications

@@ -68,61 +68,13 @@ jobs:
 
       - name: Add test summary
         if: always()
-        env:
-          BETA_BRANCH: ${{ inputs.branch }}
-          TEST_OUTCOME: ${{ steps.test.outcome }}
-          HEAD_REF: ${{ github.head_ref }}
-        run: |
-          python - <<'PY'
-          import os
-          import subprocess
-          import xml.etree.ElementTree as ET
+        uses: Tareku99/.github/.github/actions/ci-summary@cd06ab688b1092a2018b9de3cee09226daa3a204
+        with:
+          test-outcome: ${{ steps.test.outcome }}
+          source-sha: ${{ steps.source.outputs.sha }}
+          source-ref: ${{ inputs.branch || github.head_ref || github.ref_name }}
+          junit: test-results.xml
 
-          counts = {}
-          try:
-              root = ET.parse("test-results.xml").getroot()
-              suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
-              for key in ("tests", "failures", "errors", "skipped"):
-                  counts[key] = sum(int(suite.get(key, "0")) for suite in suites)
-              counts["passed"] = (
-                  counts["tests"] - counts["failures"] - counts["errors"] - counts["skipped"]
-              )
-          except (OSError, ET.ParseError):
-              pass
-
-          outcome = os.environ.get("TEST_OUTCOME", "not run")
-          result = {
-              "success": "✅ Passed",
-              "failure": "❌ Failed",
-              "cancelled": "⚪ Cancelled",
-              "skipped": "⏭️ Skipped",
-          }.get(outcome, "⚪ Not run")
-          repo = os.environ["GITHUB_REPOSITORY"]
-          server = os.environ["GITHUB_SERVER_URL"]
-          sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-          ref = os.environ.get("BETA_BRANCH") or os.environ.get("HEAD_REF") or os.environ["GITHUB_REF_NAME"]
-          rows = [
-              "## Test results",
-              "",
-              "| Item | Result |",
-              "| --- | --- |",
-              f"| Test suite | {result} |",
-              f"| Total tests | {counts.get('tests', 'Unavailable')} |",
-              f"| Passed | {counts.get('passed', 'Unavailable')} |",
-              f"| Failed | {counts.get('failures', 'Unavailable')} |",
-              f"| Errors | {counts.get('errors', 'Unavailable')} |",
-              f"| Skipped | {counts.get('skipped', 'Unavailable')} |",
-              "| Python | 3.11 |",
-              f"| Trigger | {os.environ['GITHUB_EVENT_NAME']} |",
-              f"| Ref | {ref} |",
-              f"| Commit | [`{sha[:7]}`]({server}/{repo}/commit/{sha}) |",
-              "",
-              "Production images publish after tests on pushes to `main` or version tags. A manual run publishes the selected branch as `beta`.",
-              "",
-          ]
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
-              summary.write("\n".join(rows))
-          PY
 
   build:
     name: build
@@ -130,7 +82,7 @@ jobs:
     if: github.event_name == 'pull_request'
     permissions:
       contents: read
-    uses: Tareku99/shared-devops/.github/workflows/docker-build.yml@a9d2beb9f2c0015f3ca455c0a21b01a869949eb2
+    uses: Tareku99/.github/.github/workflows/docker-build.yml@cd06ab688b1092a2018b9de3cee09226daa3a204
     with:
       image: ghcr.io/tareku99/anilist-mal-sync
       source_image: local-build:ci-${{ github.run_id }}-${{ github.run_attempt }}
@@ -142,7 +94,7 @@ jobs:
     permissions:
       contents: read
       packages: write
-    uses: Tareku99/shared-devops/.github/workflows/docker-publish.yml@a9d2beb9f2c0015f3ca455c0a21b01a869949eb2
+    uses: Tareku99/.github/.github/workflows/docker-publish.yml@cd06ab688b1092a2018b9de3cee09226daa3a204
     with:
       image: ghcr.io/tareku99/anilist-mal-sync
       source_image: local-build:ci-${{ github.run_id }}-${{ github.run_attempt }}
@@ -151,3 +103,19 @@ jobs:
       include_sha_tag: true
     secrets:
       ghcr_token: ${{ secrets.GITHUB_TOKEN }}
+
+  summary:
+    name: Workflow summary
+    needs: [test, build, publish]
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - name: Report workflow results
+        uses: Tareku99/.github/.github/actions/ci-summary@cd06ab688b1092a2018b9de3cee09226daa3a204
+        with:
+          jobs: ${{ toJSON(needs) }}
+          source-sha: ${{ needs.test.outputs.source_sha }}
+          source-ref: ${{ inputs.branch || github.head_ref || github.ref_name }}
+          channel: ${{ github.event_name == 'pull_request' && 'CI' || github.event_name == 'workflow_dispatch' && 'Beta' || 'Production' }}
+          image: ghcr.io/tareku99/anilist-mal-sync

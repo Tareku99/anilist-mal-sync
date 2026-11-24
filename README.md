@@ -50,11 +50,13 @@ This is a clean-room rewrite in Python with a fresh codebase and architecture.
 
 ### 2. Deploy
 
-**Option A: Docker**
+**Option A: Docker Compose**
+
+Download [docker-compose.yml](docker-compose.yml) and run these commands from the directory containing it. Keep the `data` directory for configuration and OAuth tokens when updating.
 
 ```bash
-docker pull ghcr.io/tareku99/anilist-mal-sync:latest
-docker-compose up -d
+docker compose pull
+docker compose up -d
 ```
 
 **Option B: Unraid**
@@ -64,7 +66,7 @@ docker-compose up -d
 
 ### 3. Configure
 
-The container creates `data/config.yaml` on first run. You can edit it through the **Web UI** at `http://YOUR-SERVER-IP:23080` (recommended) or directly on the filesystem:
+The container creates `data/config.yaml` on first run. Edit that file on the host and fill in your credentials before opening the web UI. The service waits for valid credentials before starting the dashboard.
 
 ```bash
 nano data/config.yaml  # Or your preferred editor
@@ -98,7 +100,7 @@ sync:
 # token_file_path: "/app/data/tokens.json"                   # OPTIONAL - has default
 ```
 
-Restart: `docker-compose restart` (or wait 60s for auto-reload)
+Run `docker compose restart` so the container reads the new credentials. On Unraid, restart it from the Docker tab.
 
 ### 4. Authenticate
 
@@ -122,41 +124,30 @@ The web UI provides:
 
 ## Local Development
 
-### Python (Direct)
+### Python
+
+The native development setup runs the same `anilist-mal-sync` CLI as the container.
 
 ```bash
-git clone https://github.com/Tareku99/anilist-mal-sync
-cd anilist-mal-sync
-py install.py  # Creates venv and installs dependencies
-
-# Activate virtual environment
-.venv\Scripts\activate  # Windows
-source .venv/bin/activate  # Linux/macOS
-
-# Configure
-cp config.example.yaml data/config.yaml
-notepad data/config.yaml  # Edit with your credentials
-
-# Authenticate
-anilist-mal-sync auth
-
-# Run
-anilist-mal-sync run
+python -m venv .venv
+source .venv/bin/activate  # PowerShell: .venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev]"
+python -m pytest
 ```
 
-> **Note**: Use `http://localhost:18080/callback` for `redirect_uri` when testing locally.
+To exercise the live sync, copy `config.example.yaml` to `data/config.yaml`, fill in your settings, use `http://localhost:18080/callback` for local OAuth, and run `anilist-mal-sync auth` followed by `anilist-mal-sync run`.
 
-### Docker (Local Build)
+### Local image build
 
 ```bash
-# In docker-compose.yml, uncomment: build: .
-docker-compose build
-docker-compose up
-
-# View logs for OAuth URLs, authorize in browser
+docker build -t anilist-mal-sync:local .
 ```
 
-Useful for testing Docker builds before deploying.
+Set the Compose service image to `anilist-mal-sync:local` and run `docker compose up`.
+
+## Image releases
+
+Pull requests run tests and build the image without publishing. Merges to `main` and eligible version tags publish to GHCR. To publish a beta, run **Actions → Docker Release** from `main` and enter the source branch in the **branch** input. Preview releases use `:beta` and `:beta-<commit>`; production installs use `:latest`.
 
 ## Available Commands
 
@@ -416,13 +407,15 @@ src/anilist_mal_sync/
 
 ## Contributing
 
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+See the [shared contribution guidelines](https://github.com/Tareku99/.github/blob/main/CONTRIBUTING.md). If you change CLI commands, sync behavior, authentication, configuration validation, or error handling, update the corresponding diagram in [How It Works](#how-it-works).
 
 ## Additional Resources
 
-- **[SUPPORT.md](SUPPORT.md)** - Get help and support
-- **[SECURITY.md](SECURITY.md)** - Security policy and vulnerability reporting
-- **[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)** - Community guidelines
+- **[Support and reporting](https://github.com/Tareku99/.github/blob/main/SUPPORT.md)** - Get help and support
+- **[Troubleshooting](docs/troubleshooting.md)** - OAuth, synchronization, and configuration
+- **[Report a vulnerability](https://github.com/Tareku99/.github/blob/main/SECURITY.md)** - Shared private reporting instructions
+- **[Deployment security](docs/deployment-security.md)** - AniList-specific guidance for credentials, volumes, and network access
+- **[Code of conduct](https://github.com/Tareku99/.github/blob/main/CODE_OF_CONDUCT.md)** - Community guidelines
 - **[LICENSE](LICENSE)** - MIT License
 
 ## Support the Project
