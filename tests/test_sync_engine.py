@@ -53,6 +53,31 @@ def test_bidirectional_sync_resolves_anilist_id_for_mal_only_entry(sync_clients)
     assert synced_entry.anilist_id == 456
 
 
+def test_bidirectional_sync_prefers_matching_mal_id(sync_clients):
+    engine, anilist, mal = sync_clients
+    mal.get_user_anime_list.return_value = [anime_entry()]
+    anilist.search_anime.return_value = [
+        {
+            "id": 999,
+            "idMal": 999,
+            "title": {"english": "Example Anime"},
+        },
+        {
+            "id": 456,
+            "idMal": 123,
+            "title": {"english": "Different English Title"},
+        },
+    ]
+    anilist.update_anime.return_value = True
+
+    result = engine.sync("bidirectional")
+
+    assert result.success is True
+    assert result.entries_synced == 1
+    synced_entry = anilist.update_anime.call_args.args[0]
+    assert synced_entry.anilist_id == 456
+
+
 def test_bidirectional_sync_reports_rejected_anilist_update(sync_clients):
     engine, anilist, mal = sync_clients
     mal.get_user_anime_list.return_value = [anime_entry()]
@@ -70,7 +95,13 @@ def test_bidirectional_sync_reports_rejected_anilist_update(sync_clients):
 def test_bidirectional_sync_skips_mal_entry_without_anilist_match(sync_clients):
     engine, anilist, mal = sync_clients
     mal.get_user_anime_list.return_value = [anime_entry()]
-    anilist.search_anime.return_value = []
+    anilist.search_anime.return_value = [
+        {
+            "id": 999,
+            "idMal": 999,
+            "title": {"english": "Unrelated Anime"},
+        }
+    ]
 
     result = engine.sync("bidirectional")
 
