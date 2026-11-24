@@ -1,0 +1,153 @@
+name: Docker Release
+run-name: "${{ github.event_name == 'workflow_dispatch' && format('Beta • {0}', inputs.branch) || github.event_name == 'pull_request' && format('PR #{0} • {1}', github.event.number, github.head_ref) || format('Production • {0}', github.ref_name) }}"
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch to publish as beta (run this workflow from main)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-release-${{ github.event.pull_request.number || (github.event_name == 'workflow_dispatch' && 'beta') || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - name: Validate beta branch
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          BETA_BRANCH: ${{ inputs.branch }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]]; then
+            echo "::error::Run this workflow from the default branch and enter the beta branch as an input."
+            exit 1
+          fi
+          git check-ref-format "refs/heads/$BETA_BRANCH"
+
+      - name: Check out application source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/heads/{0}', inputs.branch) || github.sha }}
+          persist-credentials: false
+
+      - name: Record source commit
+        id: source
+        shell: bash
+        run: printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run tests
+        id: test
+        run: pytest tests/ -v --junitxml=test-results.xml
+
+      - name: Add test summary
+        if: always()
+        env:
+          BETA_BRANCH: ${{ inputs.branch }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+          import xml.etree.ElementTree as ET
+
+          counts = {}
+          try:
+              root = ET.parse("test-results.xml").getroot()
+              suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+              for key in ("tests", "failures", "errors", "skipped"):
+                  counts[key] = sum(int(suite.get(key, "0")) for suite in suites)
+              counts["passed"] = (
+                  counts["tests"] - counts["failures"] - counts["errors"] - counts["skipped"]
+              )
+          except (OSError, ET.ParseError):
+              pass
+
+          outcome = os.environ.get("TEST_OUTCOME", "not run")
+          result = {
+              "success": "✅ Passed",
+              "failure": "❌ Failed",
+              "cancelled": "⚪ Cancelled",
+              "skipped": "⏭️ Skipped",
+          }.get(outcome, "⚪ Not run")
+          repo = os.environ["GITHUB_REPOSITORY"]
+          server = os.environ["GITHUB_SERVER_URL"]
+          sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          ref = os.environ.get("BETA_BRANCH") or os.environ.get("HEAD_REF") or os.environ["GITHUB_REF_NAME"]
+          rows = [
+              "## Test results",
+              "",
+              "| Item | Result |",
+              "| --- | --- |",
+              f"| Test suite | {result} |",
+              f"| Total tests | {counts.get('tests', 'Unavailable')} |",
+              f"| Passed | {counts.get('passed', 'Unavailable')} |",
+              f"| Failed | {counts.get('failures', 'Unavailable')} |",
+              f"| Errors | {counts.get('errors', 'Unavailable')} |",
+              f"| Skipped | {counts.get('skipped', 'Unavailable')} |",
+              "| Python | 3.11 |",
+              f"| Trigger | {os.environ['GITHUB_EVENT_NAME']} |",
+              f"| Ref | {ref} |",
+              f"| Commit | [`{sha[:7]}`]({server}/{repo}/commit/{sha}) |",
+              "",
+              "Production images publish after tests on pushes to `main` or version tags. A manual run publishes the selected branch as `beta`.",
+              "",
+          ]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("\n".join(rows))
+          PY
+
+  build:
+    name: build
+    needs: test
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+    uses: Tareku99/shared-devops/.github/workflows/docker-build.yml@a9d2beb9f2c0015f3ca455c0a21b01a869949eb2
+    with:
+      image: ghcr.io/tareku99/anilist-mal-sync
+      source_image: local-build:ci-${{ github.run_id }}-${{ github.run_attempt }}
+
+  publish:
+    name: publish
+    needs: test
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      packages: write
+    uses: Tareku99/shared-devops/.github/workflows/docker-publish.yml@a9d2beb9f2c0015f3ca455c0a21b01a869949eb2
+    with:
+      image: ghcr.io/tareku99/anilist-mal-sync
+      source_image: local-build:ci-${{ github.run_id }}-${{ github.run_attempt }}
+      source_sha: ${{ needs.test.outputs.source_sha }}
+      beta_branch: ${{ inputs.branch || '' }}
+      include_sha_tag: true
+    secrets:
+      ghcr_token: ${{ secrets.GITHUB_TOKEN }}

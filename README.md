@@ -188,7 +188,7 @@ Use --once for single sync, --no-web-ui for headless mode.
 **Options:**
 - `--mode` (default: bidirectional) Options: anilist-to-mal, mal-to-anilist, bidirectional - Sync mode: one-way or bidirectional
 - `--dry-run` - Simulate sync without making changes
-- `--interval` (default: 360) - Sync interval in minutes (default: 360 = 6 hours)
+- `--interval` (optional) - Override `sync.interval` from config in minutes; if omitted, uses the config value (default: 360 = 6 hours)
 - `--log-level` (default: INFO) Options: DEBUG, INFO, WARNING, ERROR - Logging level
 - `--once` - Run sync once and exit (no web UI, no continuous loop)
 - `--no-web-ui` - Disable web UI (continuous sync only)
@@ -216,6 +216,7 @@ Press `Ctrl+C` to stop.
 ```yaml
 sync:
   mode: "bidirectional"  # Options: anilist-to-mal, mal-to-anilist, bidirectional
+  interval: 360          # Sync interval in minutes (must be at least 1)
   dry_run: false         # Set to true to preview changes without applying
 ```
 

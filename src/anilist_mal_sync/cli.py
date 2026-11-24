@@ -15,6 +15,11 @@ from .sync_service import execute_sync, print_sync_results
 logger = logging.getLogger(__name__)
 
 
+def _resolve_sync_interval(cli_interval: int | None, config_interval: int) -> int:
+    """Prefer an explicit CLI interval; otherwise use the configured value."""
+    return config_interval if cli_interval is None else cli_interval
+
+
 def _wait_for_valid_config(config_path: str = "data/config.yaml"):
     """
     Wait for configuration to be valid.
@@ -158,9 +163,9 @@ def auth(service: str):
 )
 @click.option(
     "--interval",
-    type=int,
-    default=DEFAULT_SYNC_INTERVAL_MINUTES,
-    help=f"Sync interval in minutes (default: {DEFAULT_SYNC_INTERVAL_MINUTES} = 6 hours)",
+    type=click.IntRange(min=1),
+    default=None,
+    help=f"Sync interval in minutes (default: from config or {DEFAULT_SYNC_INTERVAL_MINUTES} = 6 hours)",
 )
 @click.option(
     "--log-level",
@@ -190,7 +195,7 @@ def auth(service: str):
     default="0.0.0.0",
     help="Web UI host",
 )
-def run(mode: str, dry_run: bool, interval: int, log_level: str, once: bool, no_web_ui: bool, port: int, host: str):
+def run(mode: str, dry_run: bool, interval: int | None, log_level: str, once: bool, no_web_ui: bool, port: int, host: str):
     """
     Run sync service (default: continuous sync with web UI).
     
@@ -222,8 +227,10 @@ def run(mode: str, dry_run: bool, interval: int, log_level: str, once: bool, no_
             sys.exit(1)
     
     # Default or --no-web-ui: Continuous sync loop
-    interval_seconds = interval * 60
     settings = get_settings()
+    interval_override = interval
+    interval = _resolve_sync_interval(interval_override, settings.sync_interval)
+    interval_seconds = interval * 60
     
     logger.info("="*60)
     logger.info("Starting AniList-MAL Sync Service")
@@ -278,6 +285,7 @@ def run(mode: str, dry_run: bool, interval: int, log_level: str, once: bool, no_
         
         # Start sync service in background thread
         def sync_service():
+            nonlocal interval, interval_seconds
             last_mtime = None
             config_valid = True
             run_count = 0
@@ -307,6 +315,8 @@ def run(mode: str, dry_run: bool, interval: int, log_level: str, once: bool, no_
                                 logger.info("[OK] Configuration validated successfully! Resuming sync service...")
                             config_valid = True
                             settings = current_settings
+                            interval = _resolve_sync_interval(interval_override, settings.sync_interval)
+                            interval_seconds = interval * 60
                         else:
                             logger.error("")
                             _show_config_error(invalid_vars, str(config_path), exit_code=None)
@@ -472,6 +482,8 @@ def run(mode: str, dry_run: bool, interval: int, log_level: str, once: bool, no_
                         if not config_valid:
                             logger.info("[OK] Configuration validated successfully! Resuming sync service...")
                         config_valid = True
+                        interval = _resolve_sync_interval(interval_override, settings.sync_interval)
+                        interval_seconds = interval * 60
                     else:
                         logger.error("")
                         _show_config_error(invalid_vars, str(config_path), exit_code=None)
