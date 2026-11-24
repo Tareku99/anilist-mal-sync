@@ -84,16 +84,26 @@ class SyncEngine:
             return False
 
         matches = self.anilist.search_anime(entry.title, limit=3)
-        match_id = None
-        for match in matches:
-            titles = [match.get("title", {}).get(key) for key in ["romaji", "english", "native"]]
-            if any(title and title.lower() == entry.title.lower() for title in titles):
-                match_id = match.get("id")
-                break
-        if not match_id and matches:
-            match_id = matches[0].get("id")
+        match_id = next(
+            (
+                match.get("id")
+                for match in matches
+                if entry.mal_id is not None
+                and match.get("idMal") == entry.mal_id
+                and match.get("id")
+            ),
+            None,
+        )
 
-        if match_id:
+        if match_id is None:
+            for match in matches:
+                titles = [match.get("title", {}).get(key) for key in ("romaji", "english", "native")]
+                if any(title and title.casefold() == entry.title.casefold() for title in titles):
+                    match_id = match.get("id")
+                    if match_id:
+                        break
+
+        if match_id is not None:
             entry.anilist_id = match_id
             return True
         return False
