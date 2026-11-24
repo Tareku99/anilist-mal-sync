@@ -25,32 +25,14 @@ jobs:
     name: test
     runs-on: ubuntu-24.04
     outputs:
-      source_sha: ${{ steps.source.outputs.sha }}
+      source_sha: ${{ steps.source.outputs.source-sha }}
     steps:
-      - name: Validate beta branch
-        if: github.event_name == 'workflow_dispatch'
-        shell: bash
-        env:
-          BETA_BRANCH: ${{ inputs.branch }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          set -euo pipefail
-          if [[ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]]; then
-            echo "::error::Run this workflow from the default branch and enter the beta branch as an input."
-            exit 1
-          fi
-          git check-ref-format "refs/heads/$BETA_BRANCH"
-
       - name: Check out application source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/heads/{0}', inputs.branch) || github.sha }}
-          persist-credentials: false
-
-      - name: Record source commit
         id: source
-        shell: bash
-        run: printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        uses: Tareku99/.github/.github/actions/checkout-source@9b06ea2f760ae88d61a247d2104851fcc44536bd
+        with:
+          branch: ${{ inputs.branch || '' }}
+          default-branch: ${{ github.event.repository.default_branch }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -71,10 +53,9 @@ jobs:
         uses: Tareku99/.github/.github/actions/ci-summary@04dd88f13b5c0b4a07d66ddd6da00522509abb52
         with:
           test-outcome: ${{ steps.test.outcome }}
-          source-sha: ${{ steps.source.outputs.sha }}
+          source-sha: ${{ steps.source.outputs.source-sha }}
           source-ref: ${{ inputs.branch || github.head_ref || github.ref_name }}
           junit: test-results.xml
-
 
   build:
     name: build
