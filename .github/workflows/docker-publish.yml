@@ -4,7 +4,7 @@ run-name: "${{ github.event_name == 'pull_request' && format('PR #{0} • {1}', 
 on:
   push:
     branches:
-      - "**"
+      - main
   pull_request:
   workflow_dispatch:
     inputs:
@@ -100,21 +100,15 @@ jobs:
     name: build
     needs: tests
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
     permissions:
       contents: read
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+    uses: Tareku99/shared-devops/.github/workflows/docker-build.yml@6a608704827d1d8a3596811b7f8c0e79b5d7c71c
+    with:
+      image: ghcr.io/tareku99/anilist-mal-sync
+      source_image: anilist-mal-sync:ci-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - name: Build image for PR validation
-        uses: Tareku99/shared-devops/.github/actions/docker-release@3cc3ffbd30f55a40dfcf812ff2d378b4913d5180
-        with:
-          image: ghcr.io/tareku99/anilist-mal-sync
-          source_image: anilist-mal-sync:ci-${{ github.run_id }}-${{ github.run_attempt }}
-
-  build-and-push:
-    name: Build and push GHCR image
+  prepare-tags:
+    name: prepare image tags
     needs: tests
     if: >-
       github.event_name == 'workflow_dispatch' ||
@@ -122,7 +116,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
+    outputs:
+      tags: ${{ steps.meta.outputs.tags }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -155,12 +150,19 @@ jobs:
             printf '%s\n' "$delimiter"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Build and publish tested image
-        id: build
-        uses: Tareku99/shared-devops/.github/actions/docker-release@3cc3ffbd30f55a40dfcf812ff2d378b4913d5180
-        with:
-          image: ghcr.io/tareku99/anilist-mal-sync
-          source_image: anilist-mal-sync:ci-${{ github.run_id }}-${{ github.run_attempt }}
-          publish: "true"
-          tags: ${{ steps.meta.outputs.tags }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+  build-and-push:
+    name: Build and push GHCR image
+    needs: [tests, prepare-tags]
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    permissions:
+      contents: read
+      packages: write
+    uses: Tareku99/shared-devops/.github/workflows/docker-publish.yml@6a608704827d1d8a3596811b7f8c0e79b5d7c71c
+    with:
+      image: ghcr.io/tareku99/anilist-mal-sync
+      source_image: anilist-mal-sync:ci-${{ github.run_id }}-${{ github.run_attempt }}
+      tags: ${{ needs.prepare-tags.outputs.tags }}
+    secrets:
+      ghcr_token: ${{ secrets.GITHUB_TOKEN }}
