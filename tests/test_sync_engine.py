@@ -99,7 +99,7 @@ def test_bidirectional_sync_skips_mal_entry_without_anilist_match(sync_clients):
         {
             "id": 999,
             "idMal": 999,
-            "title": {"english": "Unrelated Anime"},
+            "title": {"english": "Example Anime"},
         }
     ]
 
