@@ -16,10 +16,6 @@ on:
 permissions:
   contents: read
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
-
 jobs:
   tests:
     name: Test suite
@@ -100,6 +96,23 @@ jobs:
               summary.write("\n".join(rows))
           PY
 
+  build:
+    name: build
+    needs: tests
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build image for PR validation
+        uses: Tareku99/shared-devops/.github/actions/docker-release@3360885d29d84da4ab35f868832708ff51fb6960
+        with:
+          image: ghcr.io/tareku99/anilist-mal-sync
+          source_image: anilist-mal-sync:ci-${{ github.run_id }}-${{ github.run_attempt }}
+
   build-and-push:
     name: Build and push GHCR image
     needs: tests
@@ -114,68 +127,40 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Log in to Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract image metadata
+      - name: Compute image tags
         id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-            type=ref,event=branch
-            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
-            type=sha,short=true
-
-      - name: Build and push Docker image
-        id: build
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-
-      - name: Add image summary
-        if: always()
         env:
-          JOB_STATUS: ${{ job.status }}
-          BUILD_OUTCOME: ${{ steps.build.outcome }}
-          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
-          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          python - <<'PY'
-          import os
+          set -euo pipefail
+          tag_file="$RUNNER_TEMP/anilist-image-tags.txt"
+          {
+            if [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
+              printf '%s\n' latest
+            fi
+            if [[ "$GITHUB_REF" == refs/heads/* ]]; then
+              branch="${GITHUB_REF#refs/heads/}"
+              branch="$(printf '%s' "$branch" | sed -E 's/[^A-Za-z0-9_.-]+/-/g')"
+              printf '%s\n' "$branch"
+            fi
+            if [[ -n "$INPUT_TAG" ]]; then
+              printf '%s\n' "$INPUT_TAG"
+            fi
+            printf 'sha-%s\n' "${GITHUB_SHA:0:7}"
+          } | awk 'NF && !seen[$0]++' > "$tag_file"
+          delimiter="ANILIST_TAGS_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          {
+            printf 'tags<<%s\n' "$delimiter"
+            cat "$tag_file"
+            printf '%s\n' "$delimiter"
+          } >> "$GITHUB_OUTPUT"
 
-          tags = [tag for tag in os.environ.get("IMAGE_TAGS", "").splitlines() if tag]
-          outcome = os.environ.get("BUILD_OUTCOME") or "not run"
-          digest = os.environ.get("IMAGE_DIGEST") or "Not available"
-          repo = os.environ["GITHUB_REPOSITORY"]
-          server = os.environ["GITHUB_SERVER_URL"]
-          sha = os.environ["GITHUB_SHA"]
-          rows = [
-              "## Docker image build",
-              "",
-              "| Item | Result |",
-              "| --- | --- |",
-              f"| Job | {os.environ['JOB_STATUS']} |",
-              f"| Build and push step | {outcome} |",
-              f"| Image | [`{os.environ['REGISTRY']}/{repo}`]({server}/{repo}/pkgs/container/anilist-mal-sync) |",
-              f"| Digest | `{digest}` |",
-              f"| Commit | [`{sha[:7]}`]({server}/{repo}/commit/{sha}) |",
-              "",
-              "### Published tags",
-              "",
-          ]
-          rows.extend(f"- `{tag}`" for tag in tags)
-          if not tags:
-              rows.append("- No tags were produced.")
-          rows.append("")
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
-              summary.write("\n".join(rows))
-          PY
+      - name: Build and publish tested image
+        id: build
+        uses: Tareku99/shared-devops/.github/actions/docker-release@3360885d29d84da4ab35f868832708ff51fb6960
+        with:
+          image: ghcr.io/tareku99/anilist-mal-sync
+          source_image: anilist-mal-sync:ci-${{ github.run_id }}-${{ github.run_attempt }}
+          publish: "true"
+          tags: ${{ steps.meta.outputs.tags }}
+          token: ${{ secrets.GITHUB_TOKEN }}
