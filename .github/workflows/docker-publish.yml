@@ -1,5 +1,5 @@
 name: Test and Publish Docker Image
-run-name: "${{ github.event_name }} • ${{ github.ref_name }}"
+run-name: "${{ github.event_name == 'pull_request' && format('PR #{0} • {1}', github.event.number, github.head_ref) || format('{0} • {1}', github.event_name, github.ref_name) }}"
 
 on:
   push:
@@ -48,11 +48,11 @@ jobs:
         if: always()
         env:
           TEST_OUTCOME: ${{ steps.test.outcome }}
+          HEAD_REF: ${{ github.head_ref }}
         run: |
           python - <<'PY'
           import os
           import xml.etree.ElementTree as ET
-          from pathlib import Path
 
           counts = {}
           try:
@@ -76,6 +76,7 @@ jobs:
           repo = os.environ["GITHUB_REPOSITORY"]
           server = os.environ["GITHUB_SERVER_URL"]
           sha = os.environ["GITHUB_SHA"]
+          ref = os.environ.get("HEAD_REF") or os.environ["GITHUB_REF_NAME"]
           rows = [
               "## Test results",
               "",
@@ -89,7 +90,7 @@ jobs:
               f"| Skipped | {counts.get('skipped', 'Unavailable')} |",
               f"| Python | 3.11 |",
               f"| Trigger | {os.environ['GITHUB_EVENT_NAME']} |",
-              f"| Ref | {os.environ['GITHUB_REF_NAME']} |",
+              f"| Ref | {ref} |",
               f"| Commit | [`{sha[:7]}`]({server}/{repo}/commit/{sha}) |",
               "",
               "The Docker image is published only after this test job succeeds, on pushes to `main` or a manual workflow run.",
