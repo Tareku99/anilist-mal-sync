@@ -15,6 +15,20 @@ HTTP_FORBIDDEN = 403
 HTTP_TOO_MANY_REQUESTS = 429
 
 
+class AuthenticationError(requests.HTTPError):
+    """An API rejected a token so the sync service can refresh it and retry."""
+
+    def __init__(self, service_name: str, response: requests.Response):
+        self.service_name = (
+            "mal" if service_name.lower() in {"mal", "myanimelist"} else "anilist"
+        )
+        self.partial_result = None
+        super().__init__(
+            f"{service_name} authentication failed (HTTP {response.status_code})",
+            response=response,
+        )
+
+
 class BaseAPIClient:
     """Base class for API clients with common request handling."""
 
@@ -46,3 +60,4 @@ class BaseAPIClient:
         if response.status_code in (HTTP_UNAUTHORIZED, HTTP_FORBIDDEN):
             logger.error(f"{service_name} authentication failed (HTTP {response.status_code})")
             logger.error(f"{service_name} access token is invalid or expired")
+            raise AuthenticationError(service_name, response)

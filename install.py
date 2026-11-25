@@ -17,7 +17,7 @@ def run_command(cmd, description):
         if result.returncode == 0:
             print(f"[OK] {description} - Success!")
         return result.returncode
-    except subprocess.CalledProcessError as e:
+    except subprocess.CalledProcessError:
         print(f"[ERR] {description} - Failed!")
         sys.exit(1)
 

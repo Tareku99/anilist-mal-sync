@@ -1,11 +1,11 @@
 """OAuth authentication helpers for AniList and MyAnimeList."""
 
-import hashlib
 import json
 import logging
 import secrets
+import tempfile
 import webbrowser
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Optional
@@ -52,8 +52,23 @@ class TokenManager:
     def save_tokens(self):
         """Save tokens to file."""
         self.token_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.token_file, "w") as f:
-            json.dump(self.data, f, indent=4)
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=self.token_file.parent,
+                prefix=f"{self.token_file.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as token_file:
+                temp_path = Path(token_file.name)
+                json.dump(self.data, token_file, indent=4)
+                token_file.flush()
+            temp_path.replace(self.token_file)
+        finally:
+            if temp_path is not None and temp_path.exists():
+                temp_path.unlink()
         logger.info(f"Tokens saved to {self.token_file}")
 
     def get_token(self, service: str, token_type: str = "access_token") -> Optional[str]:
@@ -68,6 +83,8 @@ class TokenManager:
         expires_in: Optional[int] = None,
     ):
         """Set tokens for a service with expiry tracking."""
+        if not access_token:
+            raise ValueError(f"Cannot save an empty access token for {service}")
         if "tokens" not in self.data:
             self.data["tokens"] = {}
         
@@ -81,10 +98,12 @@ class TokenManager:
             self.data["tokens"][service]["refresh_token"] = refresh_token
         
         # Calculate expiry time in RFC3339 format
-        if expires_in:
-            expiry = datetime.now() + timedelta(seconds=expires_in)
+        if expires_in is not None:
+            expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
             # Format as RFC3339 (compatible with Go's time.Time)
             self.data["tokens"][service]["expiry"] = expiry.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        else:
+            self.data["tokens"][service].pop("expiry", None)
 
         self.save_tokens()
 
@@ -96,10 +115,10 @@ class TokenManager:
             return True
 
         try:
-            # Parse RFC3339 format
-            expiry = datetime.strptime(expiry_str.replace("Z", "+00:00"), "%Y-%m-%dT%H:%M:%S.%f%z")
-            # Make current time timezone-aware for comparison
-            from datetime import timezone
+            # Accept RFC3339 timestamps both with and without fractional seconds.
+            expiry = datetime.fromisoformat(expiry_str.replace("Z", "+00:00"))
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
             now = datetime.now(timezone.utc)
             # Add buffer to refresh before actual expiry
             return now >= (expiry - timedelta(seconds=buffer_seconds))
@@ -111,25 +130,39 @@ class TokenManager:
         self, service: str, settings: Settings, refresh_func=None
     ) -> Optional[str]:
         """Get a valid token, refreshing if necessary."""
-        # Check if token exists
+        # Check if token or refresh credentials exist
         if service not in self.data.get("tokens", {}):
+            logger.warning(f"No token found for {service}")
+            return None
+        access_token = self.get_token(service, "access_token")
+        refresh_token = self.get_token(service, "refresh_token")
+        if not access_token and not (refresh_func and refresh_token):
             logger.warning(f"No token found for {service}")
             return None
 
         # Check if token is expired
         if self.is_token_expired(service):
             logger.info(f"Token for {service} is expired or expiring soon, refreshing...")
-            if refresh_func and self.get_token(service, "refresh_token"):
+            if refresh_func and refresh_token:
                 try:
                     refresh_func(service, settings, self)
                 except Exception as e:
                     logger.error(f"Failed to refresh token for {service}: {e}")
                     return None
+                refreshed_token = self.get_token(service, "access_token")
+                if not refreshed_token or self.is_token_expired(service):
+                    logger.error(f"Refresh did not produce a valid token for {service}")
+                    return None
+                return refreshed_token
             else:
                 logger.warning(f"Cannot refresh token for {service} - no refresh function")
-                return self.get_token(service, "access_token")
+                # An access token with no expiry metadata may still be valid.
+                # Let the API verify it instead of forcing an OAuth prompt.
+                if not self.data["tokens"][service].get("expiry"):
+                    return access_token
+                return None
 
-        return self.get_token(service, "access_token")
+        return access_token
 
 
 class OAuthCallbackHandler(BaseHTTPRequestHandler):
@@ -307,12 +340,15 @@ def refresh_mal_token(service: str, settings: Settings, token_manager: TokenMana
 
     oauth = MALOAuth(settings)
     token_data = oauth.refresh_access_token(refresh_token)
+    access_token = token_data.get("access_token")
+    if not access_token:
+        raise ValueError("MAL token refresh response did not include an access token")
 
     # Update tokens
     token_manager.set_tokens(
         service,
-        token_data.get("access_token"),
-        token_data.get("refresh_token", refresh_token),  # Use new or keep old
+        access_token,
+        token_data.get("refresh_token") or refresh_token,
         token_data.get("expires_in"),
     )
 
@@ -320,6 +356,8 @@ def refresh_mal_token(service: str, settings: Settings, token_manager: TokenMana
 def run_oauth_flow(service: str, settings: Settings, token_manager: TokenManager) -> bool:
     """Run OAuth flow for a service."""
     logger.info(f"Starting OAuth flow for {service}...")
+    OAuthCallbackHandler.auth_code = None
+    OAuthCallbackHandler.state = None
 
     # Initialize OAuth handler
     if service == "anilist":

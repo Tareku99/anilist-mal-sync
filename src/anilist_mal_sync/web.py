@@ -15,8 +15,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from .config import Settings, get_settings, reload_settings
-from .sync_service import execute_sync
+from .config import get_settings, reload_settings
+from .sync_service import execute_sync, print_sync_results
 
 logger = logging.getLogger(__name__)
 
@@ -503,26 +503,43 @@ async def trigger_sync():
                 success, result = execute_sync(mode, dry_run=dry_run, settings=settings)
                 
                 if success and result:
-                    total = result.entries_synced + result.entries_failed
-                    if result.success:
-                        result_msg = f"{result.entries_synced}/{total} synced, 0 failed (Manual)"
-                        logger.info(f"[INFO] Manual sync completed: {result_msg}")
-                    elif result.entries_synced > 0:
-                        result_msg = f"{result.entries_synced}/{total} synced, {result.entries_failed} failed (Manual)"
-                        logger.warning(f"[WARNING] Manual sync completed: {result_msg}")
+                    if result.dry_run:
+                        print_sync_results(result, mode)
+                        result_msg = (
+                            f"Dry run: {result.planned_changes} planned, "
+                            f"{len(result.skipped_conflicts)} conflicts (Manual)"
+                        )
+                        logger.info("[INFO] Manual sync completed: %s", result_msg)
                     else:
-                        result_msg = f"0/{total} synced, {result.entries_failed} failed (Manual)"
-                        logger.error(f"[ERROR] Manual sync failed: {result_msg}")
+                        total = result.entries_synced + result.entries_failed
+                        if result.success:
+                            result_msg = f"{result.entries_synced}/{total} synced, 0 failed (Manual)"
+                            logger.info(f"[INFO] Manual sync completed: {result_msg}")
+                        elif result.entries_synced > 0:
+                            result_msg = f"{result.entries_synced}/{total} synced, {result.entries_failed} failed (Manual)"
+                            logger.warning(f"[WARNING] Manual sync completed: {result_msg}")
+                        else:
+                            result_msg = f"0/{total} synced, {result.entries_failed} failed (Manual)"
+                            logger.error(f"[ERROR] Manual sync failed: {result_msg}")
                     
                     update_sync_status(
                         last_sync=time.strftime('%Y-%m-%d %H:%M:%S %Z'),
                         last_result=result_msg
                     )
                 else:
-                    logger.error("[ERROR] Manual sync failed: Could not execute sync")
+                    if result is not None:
+                        print_sync_results(result, mode)
+                        result_msg = (
+                            f"Failed: {result.entries_synced} writes, "
+                            f"{result.entries_failed} errors (Manual)"
+                        )
+                        logger.error("[ERROR] Manual sync failed: %s", result_msg)
+                    else:
+                        logger.error("[ERROR] Manual sync failed: Could not execute sync")
+                        result_msg = "Failed (Manual)"
                     update_sync_status(
                         last_sync=time.strftime('%Y-%m-%d %H:%M:%S %Z'),
-                        last_result="Failed (Manual)"
+                        last_result=result_msg
                     )
             except Exception as e:
                 logger.error(f"[ERROR] Manual sync failed: {e}")
