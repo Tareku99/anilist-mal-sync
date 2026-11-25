@@ -11,7 +11,7 @@ This is a clean-room rewrite in Python with a fresh codebase and architecture.
 
 ## Features
 
-- **Bidirectional sync** with conflict resolution (latest update wins)
+- **Bidirectional sync** with deterministic conflict handling (newer update wins; ambiguous conflicts are reported and skipped)
 - **One-way sync modes**: AniList → MAL or MAL → AniList
 - **OAuth authentication** for both services
 - **Docker deployment** with auto-configuration
@@ -193,6 +193,9 @@ anilist-mal-sync run
 # Run sync once and exit
 anilist-mal-sync run --once
 
+# Preview a single sync without changing either anime list
+anilist-mal-sync run --once --dry-run
+
 # Run continuous sync without web UI
 anilist-mal-sync run --no-web-ui
 
@@ -210,6 +213,14 @@ sync:
   interval: 360          # Sync interval in minutes (must be at least 1)
   dry_run: false         # Set to true to preview changes without applying
 ```
+
+### Dry-run diff output
+
+`run --once --dry-run` fetches both lists, plans the same additions and updates as a normal sync, and prints a JSON summary with `additions`, `updates`, `skipped_conflicts`, and `skipped`. Each change includes its direction, IDs, affected fields, and before/after values. The plan is sorted by MAL ID so repeated runs over unchanged lists produce stable output. Dry-run never calls list-update endpoints; OAuth may still refresh or request tokens so the lists can be read.
+
+In bidirectional mode, a strictly newer update timestamp wins. If timestamps are equal or either timestamp is missing, differing statuses are reported as conflicts and skipped. When timestamps are unavailable, only a higher episode count with the same status and no other differing fields is merged automatically.
+
+Sync runs use an OS-backed lock in the configured token directory, preventing separate local processes that share that directory from syncing at the same time. AniList and MAL do not provide conditional list writes here, so an external edit made after the lists are fetched can still race with a pending update.
 
 ## How It Works
 

@@ -3,7 +3,8 @@
 import logging
 from typing import Optional
 
-from .base_client import BaseAPIClient
+from .base_client import AuthenticationError, BaseAPIClient
+from .config import Settings, get_settings
 from .models import AnimeEntry, WatchStatus
 
 logger = logging.getLogger(__name__)
@@ -19,7 +20,7 @@ class AniListClient(BaseAPIClient):
 
     BASE_URL = "https://graphql.anilist.co"
 
-    def __init__(self, access_token: str):
+    def __init__(self, access_token: str, settings: Settings | None = None):
         """Initialize AniList client with access token."""
         super().__init__(
             access_token=access_token,
@@ -29,6 +30,7 @@ class AniListClient(BaseAPIClient):
                 "Accept": "application/json",
             }
         )
+        self.settings = settings or get_settings()
     
     @staticmethod
     def _safe_title(title: str) -> str:
@@ -118,12 +120,8 @@ class AniListClient(BaseAPIClient):
         """
 
         variables = {"search": title, "limit": limit}
-        try:
-            data = self._query(query, variables)
-            return data.get("Page", {}).get("media", [])
-        except Exception as e:
-            logger.error(f"AniList search failed for '{title}': {e}")
-            return []
+        data = self._query(query, variables)
+        return data.get("Page", {}).get("media", [])
 
     def _parse_entry(self, entry: dict) -> AnimeEntry:
         """Parse AniList entry to common model."""
@@ -175,27 +173,39 @@ class AniListClient(BaseAPIClient):
             WatchStatus.PLAN_TO_WATCH: "PLANNING",
         }
 
-        mutation = """
-        mutation ($mediaId: Int, $status: MediaListStatus, $score: Float, $progress: Int, $repeat: Int, $notes: String) {
-          SaveMediaListEntry(mediaId: $mediaId, status: $status, score: $score, progress: $progress, repeat: $repeat, notes: $notes) {
-            id
-          }
-        }
-        """
-
         variables = {
             "mediaId": entry.anilist_id,
             "status": status_map.get(entry.status),
-            "score": entry.score,
             "progress": entry.episodes_watched,
             "repeat": entry.rewatched,
             "notes": entry.notes,
         }
+        score_argument = ""
+        score_variable = ""
+        if self.settings.score_sync_mode == "auto":
+            score_argument = ", scoreRaw: $scoreRaw"
+            score_variable = ", $scoreRaw: Int"
+            normalized_score = entry.score
+            if normalized_score is not None and normalized_score <= 10:
+                normalized_score *= 10
+            variables["scoreRaw"] = (
+                int(round(normalized_score)) if normalized_score is not None else 0
+            )
+
+        mutation = f"""
+        mutation ($mediaId: Int, $status: MediaListStatus{score_variable}, $progress: Int, $repeat: Int, $notes: String) {{
+          SaveMediaListEntry(mediaId: $mediaId, status: $status{score_argument}, progress: $progress, repeat: $repeat, notes: $notes) {{
+            id
+          }}
+        }}
+        """
 
         try:
             self._query(mutation, variables)
             logger.info(f"Updated AniList entry: {self._safe_title(entry.title)} (episodes: {entry.episodes_watched})")
             return True
+        except AuthenticationError:
+            raise
         except Exception as e:
             logger.error(f"Failed to update AniList entry {self._safe_title(entry.title)}: {e}")
             return False

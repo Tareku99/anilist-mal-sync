@@ -1,9 +1,9 @@
 """MyAnimeList API client."""
 
 import logging
-from typing import Optional
 
-from .base_client import BaseAPIClient
+from .base_client import AuthenticationError, BaseAPIClient
+from .config import Settings, get_settings
 from .models import AnimeEntry, WatchStatus
 
 logger = logging.getLogger(__name__)
@@ -14,9 +14,10 @@ class MALClient(BaseAPIClient):
 
     BASE_URL = "https://api.myanimelist.net/v2"
 
-    def __init__(self, access_token: str):
+    def __init__(self, access_token: str, settings: Settings | None = None):
         """Initialize MAL client with access token."""
         super().__init__(access_token=access_token, base_url=self.BASE_URL)
+        self.settings = settings or get_settings()
     
     @staticmethod
     def _safe_title(title: str) -> str:
@@ -90,8 +91,6 @@ class MALClient(BaseAPIClient):
 
     def update_anime(self, entry: AnimeEntry) -> bool:
         """Update an anime entry on MyAnimeList."""
-        from .config import get_settings
-        
         if not entry.mal_id:
             logger.warning(f"Cannot update MAL entry without mal_id: {self._safe_title(entry.title)}")
             return False
@@ -112,20 +111,16 @@ class MALClient(BaseAPIClient):
         }
 
         # Handle score syncing based on configuration
-        settings = get_settings()
-        if entry.score is not None and settings.score_sync_mode == "auto":
+        if self.settings.score_sync_mode == "auto":
             # Normalize score: AniList can use 100-point scale, MAL only accepts 0-10
             normalized_score = entry.score
-            if normalized_score > 10:
+            if normalized_score is not None and normalized_score > 10:
                 normalized_score = normalized_score / 10.0
-            data["score"] = int(round(normalized_score))  # MAL expects 0-10 integer
+            data["score"] = int(round(normalized_score)) if normalized_score is not None else 0
         # If score_sync_mode == "disabled", skip score field entirely
 
-        if entry.notes:
-            data["comments"] = entry.notes
-        
-        if entry.rewatched > 0:
-            data["num_times_rewatched"] = entry.rewatched
+        data["comments"] = entry.notes or ""
+        data["num_times_rewatched"] = entry.rewatched
 
         try:
             response = self.session.patch(url, data=data)
@@ -133,6 +128,8 @@ class MALClient(BaseAPIClient):
             response.raise_for_status()
             logger.info(f"Updated MAL entry: {self._safe_title(entry.title)} (episodes: {entry.episodes_watched})")
             return True
+        except AuthenticationError:
+            raise
         except Exception as e:
             logger.error(f"Failed to update MAL entry {self._safe_title(entry.title)}: {e}")
             return False
@@ -142,10 +139,7 @@ class MALClient(BaseAPIClient):
         url = f"{self.base_url}/anime"
         params = {"q": title, "limit": limit}
 
-        try:
-            response = self.session.get(url, params=params)
-            response.raise_for_status()
-            return response.json().get("data", [])
-        except Exception as e:
-            logger.error(f"Failed to search MAL for '{title}': {e}")
-            return []
+        response = self.session.get(url, params=params)
+        self._handle_auth_error(response, "MyAnimeList")
+        response.raise_for_status()
+        return response.json().get("data", [])
