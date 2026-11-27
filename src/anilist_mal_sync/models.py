@@ -68,6 +68,7 @@ class SyncResult(BaseModel):
     errors: list[str] = Field(default_factory=list)
     dry_run: bool = False
     accounts: dict[str, str] = Field(default_factory=dict)
+    authentication_required: list[str] = Field(default_factory=list)
     additions: list[SyncChange] = Field(default_factory=list)
     updates: list[SyncChange] = Field(default_factory=list)
     skipped_conflicts: list[SyncChange] = Field(default_factory=list)

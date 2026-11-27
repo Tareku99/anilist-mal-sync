@@ -7,10 +7,11 @@ import time
 from pathlib import Path
 
 import click
+import yaml
 
 from .config import get_settings, reload_settings, validate_credentials
 from .constants import CONFIG_RETRY_INTERVAL_SECONDS, DEFAULT_SYNC_INTERVAL_MINUTES, DEFAULT_WEB_UI_PORT
-from .sync_service import execute_sync, print_sync_results
+from .sync_service import execute_sync, print_sync_results, sync_readiness
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +35,11 @@ def _wait_for_valid_config(config_path: str = "data/config.yaml"):
         retry_count += 1
         logger.info(f"[Attempt #{retry_count}] Validating configuration...")
         
-        _ = get_settings()
-        is_valid, invalid_vars = validate_credentials()
+        try:
+            reload_settings()
+            is_valid, invalid_vars = validate_credentials()
+        except (OSError, ValueError, TypeError, yaml.YAMLError):
+            is_valid, invalid_vars = False, ["config.yaml"]
         
         if is_valid:
             if retry_count > 1:
@@ -178,6 +182,10 @@ def auth(service: str):
     help="Run sync once and exit (no web UI, no continuous loop)",
 )
 @click.option(
+    "--mal-id", "mal_ids", type=click.IntRange(min=1), multiple=True,
+    help="Limit a one-time sync or preview to the specified MAL ID. Repeat for more titles.",
+)
+@click.option(
     "--no-web-ui",
     is_flag=True,
     help="Disable web UI (continuous sync only)",
@@ -194,25 +202,35 @@ def auth(service: str):
     default="0.0.0.0",
     help="Web UI host",
 )
-def run(mode: str | None, dry_run: bool, interval: int | None, log_level: str, once: bool, no_web_ui: bool, port: int, host: str):
+def run(mode: str | None, dry_run: bool, interval: int | None, log_level: str, once: bool, no_web_ui: bool, port: int, host: str, mal_ids: tuple[int, ...]):
     """
     Run sync service (default: continuous sync with web UI).
     
     Default: Runs continuous sync at specified interval with web UI.
     Use --once for single sync, --no-web-ui for headless mode.
     """
-    settings = get_settings()
-    setup_logging(log_level or settings.log_level)
-    
-    # Wait for valid configuration (consistent behavior for all commands)
+    if mal_ids and not once:
+        raise click.UsageError("--mal-id requires --once")
     config_path = Path("/app/data/config.yaml") if os.path.exists("/.dockerenv") else Path("data/config.yaml")
-    _wait_for_valid_config(str(config_path))
+    if once or no_web_ui:
+        setup_logging(log_level or "INFO")
+        _wait_for_valid_config(str(config_path))
+    try:
+        settings = get_settings()
+    except (OSError, ValueError, TypeError, yaml.YAMLError):
+        if once or no_web_ui:
+            raise
+        settings = None
+    setup_logging(log_level or (settings.log_level if settings else "INFO"))
     
     # --once: Run sync once and exit (like old sync command)
     if once:
         try:
             run_mode = mode or settings.sync_mode
-            success, result = execute_sync(run_mode, dry_run=dry_run or settings.dry_run, settings=settings)
+            success, result = execute_sync(
+                run_mode, dry_run=dry_run or settings.dry_run, settings=settings,
+                mal_ids=frozenset(mal_ids),
+            )
             
             if not success or result is None:
                 if result is not None:
@@ -229,14 +247,15 @@ def run(mode: str | None, dry_run: bool, interval: int | None, log_level: str, o
             sys.exit(1)
     
     # Default or --no-web-ui: Continuous sync loop
-    settings = get_settings()
     interval_override = interval
-    interval = _resolve_sync_interval(interval_override, settings.sync_interval)
+    interval = _resolve_sync_interval(
+        interval_override, settings.sync_interval if settings else DEFAULT_SYNC_INTERVAL_MINUTES
+    )
     interval_seconds = interval * 60
     
     logger.info("="*60)
     logger.info("Starting AniList-MAL Sync Service")
-    logger.info(f"Mode: {mode or settings.sync_mode}")
+    logger.info("Mode: %s", mode or (settings.sync_mode if settings else "waiting for configuration"))
     logger.info(f"Interval: {interval} minutes ({interval//60}h {interval%60}m)")
     if not no_web_ui:
         # Determine Web UI URL
@@ -246,7 +265,6 @@ def run(mode: str | None, dry_run: bool, interval: int | None, log_level: str, o
                 # In Docker: Use IP from redirect_uri in config
                 config_path = Path("/app/data/config.yaml")
                 if config_path.exists():
-                    import yaml
                     with open(config_path, 'r') as f:
                         config = yaml.safe_load(f)
                         redirect_uri = config.get('oauth', {}).get('redirect_uri', '')
@@ -280,7 +298,7 @@ def run(mode: str | None, dry_run: bool, interval: int | None, log_level: str, o
     if not no_web_ui:
         import threading
         import uvicorn
-        from .web import app, update_sync_status, set_cli_sync_params, is_sync_running, acquire_sync_lock
+        from .web import app, update_sync_status, set_cli_sync_params, acquire_sync_lock
         
         # Store CLI sync parameters for manual sync button
         set_cli_sync_params(mode, dry_run)
@@ -288,8 +306,8 @@ def run(mode: str | None, dry_run: bool, interval: int | None, log_level: str, o
         # Start sync service in background thread
         def sync_service():
             nonlocal interval, interval_seconds
-            last_mtime = None
-            config_valid = True
+            last_mtime = object()
+            config_valid = False
             run_count = 0
             
             # Initialize status
@@ -332,25 +350,19 @@ def run(mode: str | None, dry_run: bool, interval: int | None, log_level: str, o
                 
                 # If config is invalid, wait and retry
                 if not config_valid:
+                    update_sync_status(sync_readiness="Configuration required")
                     time.sleep(10)
                     continue
                 
                 # Skip scheduled sync if any sync is already running (using lock)
-                if is_sync_running():
-                    logger.info("[INFO] Sync already in progress, skipping scheduled sync. Will retry after interval...")
-                    try:
-                        time.sleep(interval_seconds)
-                    except KeyboardInterrupt:
-                        update_sync_status(running=False)
-                        logger.info("Sync service stopped")
-                        break
-                    continue
-                
-                # Try to acquire sync lock
                 if not acquire_sync_lock():
-                    logger.info("[INFO] Could not acquire sync lock, skipping scheduled sync. Will retry after interval...")
+                    delay = min(interval_seconds, 30)
+                    logger.info("Scheduled sync deferred because another sync is active. Retrying in %s seconds.", delay)
+                    update_sync_status(
+                        next_sync=time.strftime('%Y-%m-%d %H:%M:%S %Z', time.localtime(time.time() + delay))
+                    )
                     try:
-                        time.sleep(interval_seconds)
+                        time.sleep(delay)
                     except KeyboardInterrupt:
                         update_sync_status(running=False)
                         logger.info("Sync service stopped")
@@ -363,6 +375,7 @@ def run(mode: str | None, dry_run: bool, interval: int | None, log_level: str, o
                 try:
                     run_mode = mode or settings.sync_mode
                     success, result = execute_sync(run_mode, dry_run=dry_run or settings.dry_run, settings=settings)
+                    update_sync_status(sync_readiness=sync_readiness(result, success))
                     if result is not None and result.accounts:
                         update_sync_status(accounts=result.accounts)
                     if success and result:
@@ -422,6 +435,7 @@ def run(mode: str | None, dry_run: bool, interval: int | None, log_level: str, o
                             )
                 except Exception as e:
                     logger.error(f"Sync run #{run_count} failed with exception: {e}")
+                    update_sync_status(sync_readiness="Error")
                     update_sync_status(
                         running=True,
                         last_sync=time.strftime('%Y-%m-%d %H:%M:%S %Z'),

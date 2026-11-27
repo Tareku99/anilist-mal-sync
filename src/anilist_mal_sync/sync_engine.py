@@ -29,6 +29,7 @@ class SyncEngine:
         dry_run: bool = False,
         settings: Settings | None = None,
         history_directory: Path | None = None,
+        mal_ids: frozenset[int] = frozenset(),
     ):
         """Initialize the engine with API clients and an optional settings snapshot."""
         self.anilist = anilist_client
@@ -36,6 +37,7 @@ class SyncEngine:
         self.dry_run = dry_run
         self.settings = settings or get_settings()
         self.history_directory = history_directory
+        self.mal_ids = mal_ids
 
     @staticmethod
     def _safe_title(title: str) -> str:
@@ -312,6 +314,8 @@ class SyncEngine:
 
         for source_entry in self._ordered_entries(source_entries):
             mal_id = source_entry.mal_id
+            if self.mal_ids and mal_id not in self.mal_ids:
+                continue
             if mal_id is None:
                 self._skip(result, source_entry, "missing MAL ID; cannot match across services")
                 continue
@@ -459,14 +463,17 @@ class SyncEngine:
         }
 
         for entry in self._ordered_entries(anilist_entries):
-            if entry.mal_id is None:
+            if entry.mal_id is None and not self.mal_ids:
                 self._skip(result, entry, "missing MAL ID; cannot match across services")
 
         for entry in self._ordered_entries(mal_entries):
-            if entry.mal_id is None:
+            if entry.mal_id is None and not self.mal_ids:
                 self._skip(result, entry, "missing MAL ID; cannot match across services")
 
-        for mal_id in sorted(set(anilist_groups) | set(mal_groups)):
+        all_ids = set(anilist_groups) | set(mal_groups)
+        if self.mal_ids:
+            all_ids.intersection_update(self.mal_ids)
+        for mal_id in sorted(all_ids):
             anilist_matches = anilist_groups.get(mal_id, [])
             mal_matches = mal_groups.get(mal_id, [])
             if len(anilist_matches) > 1 or len(mal_matches) > 1:

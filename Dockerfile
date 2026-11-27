@@ -17,7 +17,7 @@ VOLUME ["/app/data"]
 
 # Add healthcheck
 HEALTHCHECK --interval=5m --timeout=10s --start-period=10s --retries=3 \
-  CMD python -m anilist_mal_sync.healthcheck || exit 1
+  CMD python -m anilist_mal_sync.healthcheck --liveness || exit 1
 
 # Add Unraid labels for WebUI
 LABEL net.unraid.docker.webui="http://[IP]:[PORT:23080]"

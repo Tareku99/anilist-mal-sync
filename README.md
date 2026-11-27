@@ -106,6 +106,8 @@ Run `docker compose restart` so the container reads the new credentials. On Unra
 
 Check container logs for OAuth URLs, open them in your browser to authorize, and the service will start syncing automatically.
 
+Docker reports whether the dashboard is reachable. **Sync Readiness** on the dashboard reports whether the latest sync attempt could use your configuration and authorized accounts. A fresh container can serve the dashboard while it waits for configuration or OAuth.
+
 ### 5. Access Web UI
 
 Once running, access the web dashboard at:
@@ -217,6 +219,8 @@ sync:
 ### Dry-run diff output
 
 `run --once --dry-run` fetches both lists, plans the same additions and updates as a normal sync, and prints a JSON summary with `additions`, `updates`, `skipped_conflicts`, and `skipped`. Each change includes its direction, IDs, affected fields, and before/after values. The plan is sorted by MAL ID so repeated runs over unchanged lists produce stable output. Dry-run never calls list-update endpoints; OAuth may still refresh or request tokens so the lists can be read.
+
+For a one-time check of a specific title, use `run --once --dry-run --mal-id 123`. Repeat `--mal-id` to include more titles. After inspecting the preview, omit `--dry-run` to apply changes only to those same IDs, provided dry-run is also disabled in the config.
 
 Bidirectional sync records agreed values for each pair of accounts in the token directory. A field changed on one side since the last agreement can sync independently of other fields. Conflicting changes and first-run disagreements are reported for review. If an entry previously seen on both lists disappears from one list, sync reports it and skips re-adding it. Dry runs leave this history untouched.
 

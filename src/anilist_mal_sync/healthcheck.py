@@ -2,6 +2,7 @@
 
 import logging
 import sys
+from http.client import HTTPConnection, HTTPException
 
 from anilist_mal_sync.config import get_settings
 from anilist_mal_sync.oauth import TokenManager
@@ -14,6 +15,20 @@ AUTH_INSTRUCTION = "   Run: anilist-mal-sync auth"
 
 def main():
     """Check if the configuration loads and both services have credentials."""
+    if "--liveness" in sys.argv[1:]:
+        connection = HTTPConnection("127.0.0.1", 23080, timeout=3)
+        try:
+            connection.request("GET", "/")
+            status = connection.getresponse().status
+            if status in (200, 401):
+                return
+            logger.error("Dashboard returned HTTP %s", status)
+        except (OSError, HTTPException):
+            logger.error("Dashboard did not respond")
+        finally:
+            connection.close()
+        sys.exit(1)
+
     try:
         settings = get_settings()
     except Exception as e:

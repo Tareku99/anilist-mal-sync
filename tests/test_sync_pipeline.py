@@ -676,15 +676,16 @@ def test_cli_dry_run_flag_requests_plan_and_prints_json(monkeypatch):
     monkeypatch.setattr(cli, "setup_logging", lambda level: None)
     monkeypatch.setattr(cli, "_wait_for_valid_config", lambda path=None: None)
 
-    def fake_execute_sync(mode, dry_run, settings=None):
-        calls.update(mode=mode, dry_run=dry_run, settings=settings)
+    def fake_execute_sync(mode, dry_run, settings=None, mal_ids=frozenset()):
+        calls.update(mode=mode, dry_run=dry_run, settings=settings, mal_ids=mal_ids)
         return True, SyncResult(success=True, dry_run=dry_run)
 
     monkeypatch.setattr(cli, "execute_sync", fake_execute_sync)
-    result = CliRunner().invoke(cli.main, ["run", "--once", "--dry-run"])
+    result = CliRunner().invoke(cli.main, ["run", "--once", "--dry-run", "--mal-id", "7"])
 
     assert result.exit_code == 0, result.output
     assert calls["dry_run"] is True
+    assert calls["mal_ids"] == frozenset({7})
     assert json.loads(result.output)["dry_run"] is True
 
 
@@ -735,8 +736,15 @@ def test_anilist_note_update_does_not_send_score_or_progress(tmp_path, monkeypat
 
 
 def test_bidirectional_history_merges_independent_fields_and_suppresses_readdition(tmp_path):
-    anilist = FakeClient([entry(7, anilist_id=70, episodes=2)])
-    mal = FakeClient([entry(7, episodes=2)])
+    class ApplyingClient(FakeClient):
+        def update_anime(self, anime_entry, *, fields=None):
+            success = super().update_anime(anime_entry, fields=fields)
+            for field in fields:
+                setattr(self.entries[0], field, getattr(anime_entry, field))
+            return success
+
+    anilist = ApplyingClient([entry(7, anilist_id=70, episodes=2)])
+    mal = ApplyingClient([entry(7, episodes=2)])
     anilist.account_key, mal.account_key = "1", "2"
 
     def sync(dry_run=False):
@@ -753,6 +761,9 @@ def test_bidirectional_history_merges_independent_fields_and_suppresses_readditi
         ("mal", ["episodes_watched"]), ("anilist", ["notes"]),
     ]
     assert sync().entries_synced == 2
+    assert anilist.entries[0].notes == mal.entries[0].notes == "MAL edit"
+    assert anilist.entries[0].episodes_watched == mal.entries[0].episodes_watched == 3
+    assert sync().planned_changes == 0
     mal.entries.clear()
     result = sync()
     assert result.additions == []
@@ -788,3 +799,62 @@ def test_anilist_missing_page_metadata_aborts_before_list_is_used(tmp_path, monk
     monkeypatch.setattr(client, "_query", lambda *args: next(pages))
     with pytest.raises(ValueError, match="incomplete anime list chunk"):
         client.get_user_anime_list()
+
+
+@pytest.mark.parametrize("mode", ["anilist-to-mal", "bidirectional"])
+def test_targeted_sync_does_not_write_other_titles(tmp_path, mode):
+    anilist = FakeClient([entry(7, anilist_id=70), entry(8, anilist_id=80)])
+    mal = FakeClient()
+    result = SyncEngine(
+        anilist, mal, settings=settings(tmp_path), mal_ids=frozenset({7}),
+    ).sync(mode)
+    assert result.entries_synced == 1
+    assert [updated.mal_id for updated in mal.updates] == [7]
+
+
+def test_readiness_reports_only_service_still_needing_authorization(tmp_path, monkeypatch):
+    config = settings(tmp_path)
+
+    def authorize(service, settings, token_manager):
+        if service == "anilist":
+            token_manager.set_tokens(service, "fixture-token", expires_in=3600)
+            return True
+        return False
+
+    monkeypatch.setattr("anilist_mal_sync.sync_service.run_oauth_flow", authorize)
+    completed, result = execute_sync("bidirectional", dry_run=True, settings=config)
+    assert not completed
+    assert result.authentication_required == ["mal"]
+
+
+@pytest.mark.parametrize(("anilist_status", "mal_status"), [
+    ("CURRENT", "watching"),
+    ("COMPLETED", "completed"),
+    ("PAUSED", "on_hold"),
+    ("DROPPED", "dropped"),
+    ("PLANNING", "plan_to_watch"),
+])
+def test_watch_status_round_trip(tmp_path, monkeypatch, anilist_status, mal_status):
+    config = settings(tmp_path)
+    anilist = AniListClient("fixture-token", config)
+    mal = MALClient("fixture-token", config)
+    al_entry = anilist._parse_entry({
+        "status": anilist_status, "media": {"id": 70, "idMal": 7, "title": {"english": "Test"}},
+    })
+    mal_entry = mal._parse_entry({
+        "list_status": {"status": mal_status}, "node": {"id": 7, "title": "Test"},
+    }).model_copy(update={"anilist_id": 70})
+    assert al_entry.status == mal_entry.status
+
+    def mutate_anilist(document, variables):
+        assert variables["status"] == anilist_status
+        return {"SaveMediaListEntry": {"id": 1}}
+
+    def patch_mal(url, *, data, **kwargs):
+        assert data["status"] == mal_status
+        return SimpleNamespace(status_code=200, raise_for_status=lambda: None)
+
+    monkeypatch.setattr(anilist, "_query", mutate_anilist)
+    monkeypatch.setattr(mal.session, "patch", patch_mal)
+    assert anilist.update_anime(mal_entry, fields=["status"])
+    assert mal.update_anime(al_entry, fields=["status"])

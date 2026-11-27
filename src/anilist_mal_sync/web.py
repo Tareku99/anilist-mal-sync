@@ -18,9 +18,9 @@ from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field, ValidationError
 
-from .config import Config, get_settings, reload_settings
+from .config import Config, get_settings, reload_settings, validate_credentials
 from .models import SyncResult
-from .sync_service import execute_sync
+from .sync_service import execute_sync, sync_readiness
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +74,7 @@ sync_status = {
     "preview": None,
     "last_manual_success": None,
     "accounts": {},
+    "sync_readiness": "Not checked",
 }
 
 # Threading lock to prevent concurrent syncs
@@ -103,6 +104,7 @@ class SyncStatus(BaseModel):
     preview_only: bool = False
     last_manual_success: bool | None = None
     accounts: dict[str, str] = Field(default_factory=dict)
+    sync_readiness: str = "Not checked"
     preview: SyncResult | None = None
 
 
@@ -288,6 +290,10 @@ async def dashboard():
                     <span class="status-value" id="status-running">Loading...</span>
                 </div>
                 <div class="status-item">
+                    <span class="status-label">Sync Readiness:</span>
+                    <span class="status-value" id="status-readiness">—</span>
+                </div>
+                <div class="status-item">
                     <span class="status-label">Last Verified Accounts:</span>
                     <span class="status-value" id="status-accounts">—</span>
                 </div>
@@ -386,6 +392,7 @@ async def dashboard():
 
         function renderStatus(data) {
             byId('status-running').textContent = data.running ? 'Running' : 'Inactive';
+            byId('status-readiness').textContent = data.sync_readiness;
             const accounts = data.accounts || {};
             byId('status-accounts').textContent = accounts.anilist && accounts.mal
                 ? 'AniList: ' + accounts.anilist + ' · MAL: ' + accounts.mal
@@ -623,6 +630,9 @@ async def trigger_sync(preview: bool = False):
     
     try:
         settings = get_settings()
+        valid, _ = validate_credentials()
+        if not valid:
+            raise HTTPException(status_code=409, detail="Save both services' client IDs and secrets first")
         mode = _cli_sync_mode if _cli_sync_mode else settings.sync_mode
         dry_run = preview or bool(_cli_dry_run) or settings.dry_run
         if dry_run:
@@ -633,6 +643,7 @@ async def trigger_sync(preview: bool = False):
             try:
                 logger.info(f"[INFO] Manual sync started (mode: {mode})")
                 success, result = execute_sync(mode, dry_run=dry_run, settings=settings)
+                update_sync_status(sync_readiness=sync_readiness(result, success))
                 if result is not None and result.accounts:
                     update_sync_status(accounts=result.accounts)
                 sync_status["last_manual_success"] = bool(success and result and result.success)
@@ -683,6 +694,7 @@ async def trigger_sync(preview: bool = False):
                     )
             except Exception as e:
                 sync_status["last_manual_success"] = False
+                update_sync_status(sync_readiness="Error")
                 logger.error(f"[ERROR] Manual sync failed: {e}")
                 update_sync_status(
                     last_sync=time.strftime('%Y-%m-%d %H:%M:%S %Z'),
@@ -693,6 +705,9 @@ async def trigger_sync(preview: bool = False):
         
         threading.Thread(target=run_manual_sync, daemon=True).start()
         return {"message": "Sync triggered successfully"}
+    except HTTPException:
+        _sync_lock.release()
+        raise
     except Exception as e:
         _sync_lock.release()
         logger.error(f"Failed to trigger sync: {e}")
@@ -704,12 +719,15 @@ def update_sync_status(
     next_sync: str | None = None, last_result: str | None = None,
     successful: bool = False,
     accounts: dict[str, str] | None = None,
+    sync_readiness: str | None = None,
 ):
     """Update the global sync status (called from CLI)"""
     if running is not None:
         sync_status["running"] = running
     if accounts is not None:
         sync_status["accounts"] = accounts
+    if sync_readiness is not None:
+        sync_status["sync_readiness"] = sync_readiness
     if last_sync:
         sync_status["last_sync"] = last_sync
         if successful:
