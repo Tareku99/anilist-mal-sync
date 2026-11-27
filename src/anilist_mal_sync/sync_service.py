@@ -382,7 +382,8 @@ def print_sync_results(result, mode: str):
             "skipped": [change.model_dump(mode="json") for change in result.skipped],
             "errors": result.errors,
         }
-        click.echo(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+        # Escapes preserve Unicode when output is redirected through a Windows code page.
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
         return
     
     click.echo("\n=== Sync Results ===")

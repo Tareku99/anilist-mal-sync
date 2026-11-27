@@ -20,7 +20,7 @@ from pydantic import BaseModel, ValidationError
 
 from .config import Config, get_settings, reload_settings
 from .models import SyncResult
-from .sync_service import execute_sync, print_sync_results
+from .sync_service import execute_sync
 
 logger = logging.getLogger(__name__)
 
@@ -629,7 +629,6 @@ async def trigger_sync(preview: bool = False):
                 
                 if success and result:
                     if result.dry_run:
-                        print_sync_results(result, mode)
                         result_msg = (
                             f"Dry run: {result.planned_changes} planned, "
                             f"{len(result.skipped_conflicts)} conflicts (Manual)"
@@ -655,7 +654,6 @@ async def trigger_sync(preview: bool = False):
                     )
                 else:
                     if result is not None:
-                        print_sync_results(result, mode)
                         result_msg = (
                             f"Failed: {result.entries_synced} writes, "
                             f"{result.entries_failed} errors (Manual)"

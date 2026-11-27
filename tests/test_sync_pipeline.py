@@ -639,13 +639,17 @@ def test_sync_lock_prevents_overlapping_process_runs(tmp_path):
 
 
 def test_dry_run_serialization_is_deterministic(monkeypatch):
-    result = SyncResult(success=True, dry_run=True)
+    result = SyncResult(success=True, dry_run=True, errors=["Title Ω"])
     output = []
-    monkeypatch.setattr("anilist_mal_sync.sync_service.click.echo", output.append)
+    monkeypatch.setattr(
+        "anilist_mal_sync.sync_service.click.echo",
+        lambda message: output.append(message.encode("cp1252")),
+    )
     print_sync_results(result, "bidirectional")
     print_sync_results(result, "bidirectional")
 
     assert output[0] == output[1]
+    assert json.loads(output[0])["errors"] == ["Title Ω"]
 
 
 def test_cli_dry_run_flag_requests_plan_and_prints_json(monkeypatch):
