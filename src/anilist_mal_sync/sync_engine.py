@@ -396,27 +396,24 @@ class SyncEngine:
         return result
 
     def _find_anilist_id(
-        self, title: str, mal_id: int | None = None
+        self, title: str, mal_id: int
     ) -> tuple[int | None, str, bool]:
-        """Require an exact MAL ID and report unverified title matches for review."""
-        matches = self.anilist.search_anime(title, limit=10)
-        candidates = [match for match in matches if match.get("id") is not None]
+        """Look up the MAL ID directly; use title search for suggestions only."""
+        matches = self.anilist.find_anime_by_mal_id(mal_id)
+        if any(match.get("idMal") != mal_id or not match.get("id") for match in matches):
+            return None, f"AniList returned inconsistent data for MAL ID {mal_id}", True
+        mal_matches = {match["id"] for match in matches}
+        if len(mal_matches) == 1:
+            return mal_matches.pop(), "", False
+        if len(mal_matches) > 1:
+            return None, f"multiple AniList results match MAL ID {mal_id}", True
 
-        if mal_id is not None:
-            mal_matches = {
-                match["id"] for match in candidates if match.get("idMal") == mal_id
-            }
-            if len(mal_matches) == 1:
-                return mal_matches.pop(), "", False
-            if len(mal_matches) > 1:
-                return None, f"multiple AniList results match MAL ID {mal_id}", True
-            candidates = [
-                match for match in candidates if match.get("idMal") in (None, mal_id)
-            ]
-
+        candidates = self.anilist.search_anime(title, limit=10)
         exact_ids = set()
         normalized_title = title.casefold().strip()
         for match in candidates:
+            if not match.get("id") or match.get("idMal") not in (None, mal_id):
+                continue
             titles = match.get("title") or {}
             if any(
                 candidate and candidate.casefold().strip() == normalized_title
@@ -427,7 +424,7 @@ class SyncEngine:
             return None, f"title matches AniList ID {exact_ids.pop()} without a verified MAL ID", True
         if len(exact_ids) > 1:
             return None, "multiple exact AniList title matches", True
-        return None, "no exact AniList title match", False
+        return None, f"no AniList entry for MAL ID {mal_id} or exact title suggestion", False
 
     def _reserve_anilist_match(
         self, result: SyncResult, entry: AnimeEntry, anilist_id: int, reserved_ids: set[int]

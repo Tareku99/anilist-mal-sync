@@ -21,6 +21,7 @@ def sync_clients(monkeypatch):
     anilist = Mock(spec=AniListClient)
     mal = Mock(spec=MALClient)
     anilist.get_user_anime_list.return_value = []
+    anilist.find_anime_by_mal_id.return_value = []
     mal.get_user_anime_list.return_value = []
     return SyncEngine(anilist, mal), anilist, mal
 
@@ -40,7 +41,7 @@ def test_bidirectional_sync_resolves_anilist_id_for_mal_only_entry(sync_clients)
     engine, anilist, mal = sync_clients
     mal_entry = anime_entry()
     mal.get_user_anime_list.return_value = [mal_entry]
-    anilist.search_anime.return_value = [{"id": 456, "idMal": 123, "title": {"english": "Example Anime"}}]
+    anilist.find_anime_by_mal_id.return_value = [{"id": 456, "idMal": 123}]
     anilist.update_anime.return_value = True
 
     result = engine.sync("bidirectional")
@@ -51,37 +52,29 @@ def test_bidirectional_sync_resolves_anilist_id_for_mal_only_entry(sync_clients)
     anilist.update_anime.assert_called_once()
     synced_entry = anilist.update_anime.call_args.args[0]
     assert synced_entry.anilist_id == 456
+    anilist.find_anime_by_mal_id.assert_called_once_with(123)
+    anilist.search_anime.assert_not_called()
 
 
-def test_bidirectional_sync_prefers_matching_mal_id(sync_clients):
+def test_bidirectional_sync_skips_duplicate_direct_id_matches(sync_clients):
     engine, anilist, mal = sync_clients
     mal.get_user_anime_list.return_value = [anime_entry()]
-    anilist.search_anime.return_value = [
-        {
-            "id": 999,
-            "idMal": 999,
-            "title": {"english": "Example Anime"},
-        },
-        {
-            "id": 456,
-            "idMal": 123,
-            "title": {"english": "Different English Title"},
-        },
+    anilist.find_anime_by_mal_id.return_value = [
+        {"id": 456, "idMal": 123},
+        {"id": 789, "idMal": 123},
     ]
-    anilist.update_anime.return_value = True
 
     result = engine.sync("bidirectional")
 
-    assert result.success is True
-    assert result.entries_synced == 1
-    synced_entry = anilist.update_anime.call_args.args[0]
-    assert synced_entry.anilist_id == 456
+    assert "multiple AniList results match MAL ID 123" == result.skipped_conflicts[0].reason
+    anilist.update_anime.assert_not_called()
+    anilist.search_anime.assert_not_called()
 
 
 def test_bidirectional_sync_reports_rejected_anilist_update(sync_clients):
     engine, anilist, mal = sync_clients
     mal.get_user_anime_list.return_value = [anime_entry()]
-    anilist.search_anime.return_value = [{"id": 456, "idMal": 123, "title": {"romaji": "Example Anime"}}]
+    anilist.find_anime_by_mal_id.return_value = [{"id": 456, "idMal": 123}]
     anilist.update_anime.return_value = False
 
     result = engine.sync("bidirectional")

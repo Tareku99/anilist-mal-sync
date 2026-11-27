@@ -124,6 +124,21 @@ class AniListClient(BaseAPIClient):
         logger.info(f"Fetched {len(entries)} anime entries from AniList")
         return entries
 
+    def find_anime_by_mal_id(self, mal_id: int) -> list[dict]:
+        """Fetch up to two exact matches so the caller can detect duplicate IDs."""
+        query = """
+        query ($malId: Int!) {
+          Page(perPage: 2) {
+            media(idMal: $malId, type: ANIME) {
+              id
+              idMal
+            }
+          }
+        }
+        """
+        data = self._query(query, {"malId": mal_id})
+        return data["Page"]["media"]
+
     def search_anime(self, title: str, limit: int = 5) -> list[dict]:
         """Search AniList anime by title to find IDs."""
         query = """

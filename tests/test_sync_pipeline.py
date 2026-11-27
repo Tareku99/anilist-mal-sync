@@ -76,6 +76,9 @@ class FakeClient:
     def search_anime(self, title, limit=5):
         return self.search_results[:limit]
 
+    def find_anime_by_mal_id(self, mal_id):
+        return [item for item in self.search_results if item.get("idMal") == mal_id]
+
 
 def test_dry_run_emits_stable_structured_diff_without_writes(tmp_path, monkeypatch):
     monkeypatch.setattr(
@@ -344,7 +347,7 @@ def test_title_only_anilist_candidate_is_reported_for_review(tmp_path, monkeypat
     assert mal.updates == []
 
 
-def test_anilist_search_prefers_matching_mal_id_over_same_title(tmp_path, monkeypatch):
+def test_anilist_direct_mal_id_lookup_ignores_different_titles(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "anilist_mal_sync.sync_engine.get_settings",
         lambda: settings(tmp_path),
@@ -366,6 +369,20 @@ def test_anilist_search_prefers_matching_mal_id_over_same_title(tmp_path, monkey
 
     assert len(result.additions) == 1
     assert result.additions[0].anilist_id == 71
+
+
+def test_anilist_direct_lookup_filters_by_mal_id(monkeypatch, tmp_path):
+    client = AniListClient("test-token", settings=settings(tmp_path))
+    matches = [{"id": 456, "idMal": 123}, {"id": 789, "idMal": 123}]
+
+    def query(document, variables):
+        assert "media(idMal: $malId, type: ANIME)" in document
+        assert "Page(perPage: 2)" in document
+        assert variables == {"malId": 123}
+        return {"Page": {"media": matches}}
+
+    monkeypatch.setattr(client, "_query", query)
+    assert client.find_anime_by_mal_id(123) == matches
 
 
 def test_anilist_search_rejects_exact_title_with_conflicting_mal_id(
@@ -391,7 +408,7 @@ def test_anilist_search_rejects_exact_title_with_conflicting_mal_id(
 
     assert result.additions == []
     assert len(result.skipped) == 1
-    assert result.skipped[0].reason == "no exact AniList title match"
+    assert result.skipped[0].reason == "no AniList entry for MAL ID 701 or exact title suggestion"
 
 
 def test_mal_rate_limit_429_retries_then_completes():
@@ -560,8 +577,8 @@ def test_anilist_auth_error_reauthenticates_only_anilist_and_restarts(tmp_path, 
             super().__init__()
             anilist_tokens.append(access_token)
 
-        def search_anime(self, title, limit=5):
-            return [{"id": 70, "idMal": 7, "title": {"english": title}}]
+        def find_anime_by_mal_id(self, mal_id):
+            return [{"id": 70, "idMal": mal_id}]
 
         def update_anime(self, anime_entry, *, fields=None):
             nonlocal fail_once
