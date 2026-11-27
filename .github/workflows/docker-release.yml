@@ -82,7 +82,7 @@ jobs:
     permissions:
       contents: write
       packages: write
-    uses: Tareku99/.github/.github/workflows/docker-version-tag.yml@f50be5ffcf546937ab9d6798ae0a7222cd5b68b1
+    uses: Tareku99/.github/.github/workflows/docker-version-tag.yml@f2fcda8ad45bc154323d5e247eb680977953e576
     with:
       image: ghcr.io/tareku99/anilist-mal-sync
       image_digest: ${{ needs.publish.outputs.digest }}
