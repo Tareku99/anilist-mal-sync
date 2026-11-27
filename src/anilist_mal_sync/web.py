@@ -5,22 +5,62 @@ Provides a simple dashboard for monitoring and controlling the sync service.
 
 import logging
 import os
+import secrets
+import tempfile
 import threading
 import time
 from pathlib import Path
 from typing import Optional
 import yaml
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from pydantic import BaseModel, ValidationError
 
-from .config import get_settings, reload_settings
+from .config import Config, get_settings, reload_settings
+from .models import SyncResult
 from .sync_service import execute_sync, print_sync_results
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="AniList-MAL Sync", version="0.1.0")
+_basic_auth = HTTPBasic(auto_error=False)
+_SECRET_MASK = "<stored secret>"
+
+
+def _check_dashboard_access(
+    request: Request, credentials: HTTPBasicCredentials | None = Depends(_basic_auth)
+):
+    password = os.environ.get("SYNC_DASHBOARD_PASSWORD")
+    if password and (
+        credentials is None
+        or credentials.username != "admin"
+        or not secrets.compare_digest(credentials.password.encode(), password.encode())
+    ):
+        raise HTTPException(401, "Dashboard sign-in required", headers={"WWW-Authenticate": "Basic"})
+    if request.method == "POST" and request.headers.get("X-Sync-Dashboard") != "1":
+        raise HTTPException(403, "Dashboard write header required")
+
+
+app = FastAPI(
+    title="AniList-MAL Sync", version="0.1.0",
+    dependencies=[Depends(_check_dashboard_access)],
+)
+
+
+def _mask_config_secrets(config: dict, existing: dict | None = None) -> None:
+    """Mask existing secrets on read and restore untouched secrets on save."""
+    for service in ("anilist", "mal", "myanimelist"):
+        section = config.get(service)
+        if not isinstance(section, dict) or "client_secret" not in section:
+            continue
+        if existing is None and section["client_secret"]:
+            section["client_secret"] = _SECRET_MASK
+        elif existing is not None and section["client_secret"] == _SECRET_MASK:
+            stored = (existing.get(service) or {}).get("client_secret")
+            if not stored:
+                raise ValueError("No saved secret exists for this service")
+            section["client_secret"] = stored
 
 # Global state for sync status
 sync_status = {
@@ -29,6 +69,7 @@ sync_status = {
     "next_sync": None,
     "last_result": None,
     "total_syncs": 0,
+    "preview": None,
 }
 
 # Threading lock to prevent concurrent syncs
@@ -54,6 +95,7 @@ class SyncStatus(BaseModel):
     last_result: Optional[str] = None
     total_syncs: int
     sync_in_progress: bool = False  # True if any sync (scheduled or manual) is running
+    preview: SyncResult | None = None
 
 
 class ConfigUpdate(BaseModel):
@@ -261,7 +303,12 @@ async def dashboard():
                     <span class="status-value" id="status-total-syncs">0</span>
                 </div>
                 <button class="btn btn-secondary" id="sync-now-btn" onclick="triggerSync(event)">▶️ Sync Now</button>
+                <button class="btn" id="preview-btn" onclick="triggerSync(event, true)">Preview Sync</button>
                 <button class="btn" id="refresh-btn" onclick="refreshStatus()">🔄 Refresh Status</button>
+                <details id="preview-details" hidden>
+                    <summary>Last preview</summary>
+                    <pre id="preview-content" style="white-space: pre-wrap; max-height: 18rem; overflow: auto"></pre>
+                </details>
             </div>
 
             <div class="card config-card">
@@ -307,6 +354,16 @@ async def dashboard():
                 const syncBtn = document.getElementById('sync-now-btn');
                 syncBtn.disabled = data.sync_in_progress;
                 syncBtn.textContent = data.sync_in_progress ? '⏳ Syncing...' : '▶️ Sync Now';
+                document.getElementById('preview-btn').disabled = data.sync_in_progress;
+                document.getElementById('preview-details').hidden = !data.preview;
+                if (data.preview) {
+                    const changes = [...data.preview.additions, ...data.preview.updates, ...data.preview.skipped_conflicts];
+                    document.getElementById('preview-content').textContent = changes.map(change => {
+                        const direction = change.source && change.target ? ' (' + change.source + ' → ' + change.target + ')' : '';
+                        const description = change.reason || JSON.stringify(change.differences);
+                        return change.title + direction + ': ' + description;
+                    }).concat(data.preview.errors).join('\\n') || 'No changes planned.';
+                }
             } catch (error) {
                 console.error('Failed to fetch status:', error);
             }
@@ -347,7 +404,7 @@ async def dashboard():
             try {
                 const response = await fetch('/api/config', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: { 'Content-Type': 'application/json', 'X-Sync-Dashboard': '1' },
                     body: JSON.stringify({ config }),
                 });
                 
@@ -363,7 +420,7 @@ async def dashboard():
         }
 
         // Trigger manual sync
-        async function triggerSync(event) {
+        async function triggerSync(event, preview = false) {
             if (event) {
                 event.preventDefault();
                 event.stopPropagation();
@@ -376,7 +433,9 @@ async def dashboard():
             btn.textContent = '⏳ Syncing...';
             
             try {
-                const response = await fetch('/api/sync/trigger', { method: 'POST' });
+                const response = await fetch('/api/sync/trigger?preview=' + preview, {
+                    method: 'POST', headers: { 'X-Sync-Dashboard': '1' }
+                });
                 if (!response.ok) {
                     const error = await response.json();
                     throw new Error(error.detail || 'Sync failed');
@@ -434,8 +493,9 @@ async def get_config():
         if not config_path.exists():
             raise HTTPException(status_code=404, detail="Config file not found")
         
-        with open(config_path, "r") as f:
-            return {"config": f.read()}
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        _mask_config_secrets(config)
+        return {"config": yaml.safe_dump(config, sort_keys=False)}
     except HTTPException:
         raise
     except Exception as e:
@@ -447,46 +507,38 @@ async def get_config():
 async def update_config(data: ConfigUpdate):
     """Update configuration file"""
     config_path = _get_config_path()
-    backup_path = config_path.parent / "config.yaml.backup"
-    
+    temp_path = None
     try:
-        # Validate YAML syntax
-        yaml.safe_load(data.config)
-        
-        # Backup existing config
-        if config_path.exists():
-            with open(config_path, "r") as f:
-                backup_content = f.read()
-            with open(backup_path, "w") as f:
-                f.write(backup_content)
-        
-        # Write new config
-        with open(config_path, "w") as f:
-            f.write(data.config)
-        
-        # Validate and reload
-        try:
-            reload_settings()
-        except Exception as e:
-            # Restore backup on validation failure
-            if backup_path.exists():
-                with open(backup_path, "r") as f:
-                    with open(config_path, "w") as f2:
-                        f2.write(f.read())
-            raise HTTPException(status_code=400, detail=f"Invalid configuration: {str(e)}")
-        
+        config = yaml.safe_load(data.config)
+        if not isinstance(config, dict):
+            raise ValueError("Configuration must be a YAML mapping")
+        existing = yaml.safe_load(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+        _mask_config_secrets(config, existing or {})
+        Config.model_validate(config)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=config_path.parent, delete=False,
+        ) as temp:
+            temp_path = Path(temp.name)
+            yaml.safe_dump(config, temp, sort_keys=False)
+        temp_path.replace(config_path)
+        reload_settings()
         return {"message": "Configuration updated successfully and reloaded"}
-    except HTTPException:
-        raise
-    except yaml.YAMLError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid YAML: {str(e)}")
-    except Exception as e:
-        logger.error(f"Failed to update config: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except ValidationError as error:
+        fields = ", ".join(".".join(map(str, item["loc"])) for item in error.errors())
+        raise HTTPException(status_code=400, detail=f"Invalid configuration fields: {fields}")
+    except (ValueError, yaml.YAMLError):
+        raise HTTPException(status_code=400, detail="Invalid configuration YAML or secret placeholder")
+    except OSError:
+        logger.error("Failed to save dashboard configuration")
+        raise HTTPException(status_code=500, detail="Could not save configuration")
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 @app.post("/api/sync/trigger")
-async def trigger_sync():
+async def trigger_sync(preview: bool = False):
     """Trigger an immediate sync"""
     if not acquire_sync_lock():
         raise HTTPException(status_code=409, detail="Sync already in progress")
@@ -494,13 +546,15 @@ async def trigger_sync():
     try:
         settings = get_settings()
         mode = _cli_sync_mode if _cli_sync_mode else settings.sync_mode
-        dry_run = bool(_cli_dry_run) or settings.dry_run
+        dry_run = preview or bool(_cli_dry_run) or settings.dry_run
         
         def run_manual_sync():
             try:
                 logger.info(f"[INFO] Manual sync started (mode: {mode})")
                 update_sync_status(running=True)
                 success, result = execute_sync(mode, dry_run=dry_run, settings=settings)
+                if dry_run:
+                    sync_status["preview"] = result
                 
                 if success and result:
                     if result.dry_run:

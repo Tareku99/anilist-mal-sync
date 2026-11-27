@@ -80,14 +80,14 @@ oauth:
 anilist:
   client_id: "your_anilist_client_id"                        # REQUIRED
   client_secret: "your_anilist_client_secret"                # REQUIRED
-  username: "your_anilist_username"                          # REQUIRED
+  # username: "your_anilist_username"                        # OPTIONAL account check
   # auth_url: "https://anilist.co/api/v2/oauth/authorize"    # OPTIONAL - has defaults
   # token_url: "https://anilist.co/api/v2/oauth/token"       # OPTIONAL - has defaults
 
 myanimelist:
   client_id: "your_mal_client_id"                            # REQUIRED
   client_secret: "your_mal_client_secret"                    # REQUIRED
-  username: "your_mal_username"                              # REQUIRED
+  # username: "your_mal_username"                            # OPTIONAL account check
   # auth_url: "https://myanimelist.net/v1/oauth2/authorize"  # OPTIONAL - has defaults
   # token_url: "https://myanimelist.net/v1/oauth2/token"     # OPTIONAL - has defaults
 
@@ -220,6 +220,8 @@ sync:
 
 In bidirectional mode, a strictly newer update timestamp wins. If timestamps are equal or either timestamp is missing, differing statuses are reported as conflicts and skipped. When timestamps are unavailable, only a higher episode count with the same status and no other differing fields is merged automatically.
 
+Both lists are read from the accounts that own the access tokens. If you configure usernames, they must match those accounts. Active rewatches and unrecognized statuses are reported as conflicts pending verification of rewatch progress and status conversion.
+
 Sync runs use an OS-backed lock in the configured token directory, preventing separate local processes that share that directory from syncing at the same time. AniList and MAL do not provide conditional list writes here, so an external edit made after the lists are fetched can still race with a pending update.
 
 ## How It Works
@@ -303,7 +305,7 @@ flowchart TD
     TokenLoad --> TokensFound{Tokens found?}
     
     TokensFound -->|Yes| CheckExpired{Token expired?}
-    TokensFound -->|No| AutoAuth[Auto-authenticate authenticate_services]
+    TokensFound -->|No| AutoAuth[Authorize services with missing tokens]
     
     AutoAuth -->|Success| TokenReady
     AutoAuth -->|Fail| ExitAuth[EXIT or Continue Loop]

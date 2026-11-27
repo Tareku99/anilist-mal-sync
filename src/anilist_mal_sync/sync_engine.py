@@ -7,7 +7,7 @@ from typing import Literal
 
 from .base_client import AuthenticationError
 from .config import Settings, get_settings
-from .models import AnimeEntry, SyncChange, SyncResult
+from .models import AnimeEntry, SyncChange, SyncResult, WatchStatus
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +189,18 @@ class SyncEngine:
             ),
         )
 
+    def _skip_unsupported_status(
+        self, result: SyncResult, entry: AnimeEntry, other: AnimeEntry | None
+    ) -> bool:
+        entries = (entry,) if other is None else (entry, other)
+        if any(item.status == WatchStatus.UNKNOWN for item in entries):
+            self._skip(result, entry, "unrecognized watch status", conflict=True)
+            return True
+        if any(item.is_rewatching for item in entries):
+            self._skip(result, entry, "active rewatch requires review", conflict=True)
+            return True
+        return False
+
     def _apply(
         self,
         result: SyncResult,
@@ -198,6 +210,8 @@ class SyncEngine:
         target: Platform,
         target_client,
     ) -> None:
+        if self._skip_unsupported_status(result, source_entry, target_entry):
+            return
         operation = "addition" if target_entry is None else "update"
         fields = list(self.SYNC_FIELDS) if target_entry is None else self._changed_fields(
             source_entry, target_entry
@@ -227,7 +241,7 @@ class SyncEngine:
             return
 
         try:
-            if target_client.update_anime(source_entry):
+            if target_client.update_anime(source_entry, fields=fields):
                 result.entries_synced += 1
             else:
                 result.entries_failed += 1
@@ -519,6 +533,8 @@ class SyncEngine:
         mal_entry: AnimeEntry,
     ) -> None:
         """Apply a clear winner or report a conflict rather than silently discarding it."""
+        if self._skip_unsupported_status(result, anilist_entry, mal_entry):
+            return
         fields = self._changed_fields(anilist_entry, mal_entry)
         if not fields:
             self._skip(result, anilist_entry, "already in sync")

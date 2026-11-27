@@ -58,8 +58,13 @@ def _release_process_sync_lock(lock_file) -> None:
     lock_file.close()
 
 
-def authenticate_services(settings: Settings, token_manager: TokenManager) -> tuple[Optional[str], Optional[str]]:
-    """Authenticate both services and return tokens.
+def authenticate_services(
+    settings: Settings,
+    token_manager: TokenManager,
+    anilist_token: str | None = None,
+    mal_token: str | None = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Authenticate services with missing tokens and return both tokens.
     
     Returns:
         tuple: (anilist_token, mal_token) or (None, None) if failed
@@ -69,7 +74,9 @@ def authenticate_services(settings: Settings, token_manager: TokenManager) -> tu
     
     auth_success = True
     
-    for service in ["anilist", "mal"]:
+    for service, token in (("anilist", anilist_token), ("mal", mal_token)):
+        if token:
+            continue
         logger.info(f"Authenticating {service.upper()}...")
         try:
             if not run_oauth_flow(service, settings, token_manager):
@@ -84,8 +91,8 @@ def authenticate_services(settings: Settings, token_manager: TokenManager) -> tu
         return None, None
     
     # Reload tokens after successful auth
-    anilist_token = token_manager.get_valid_token("anilist", settings)
-    mal_token = token_manager.get_valid_token("mal", settings, refresh_mal_token)
+    anilist_token = anilist_token or token_manager.get_valid_token("anilist", settings)
+    mal_token = mal_token or token_manager.get_valid_token("mal", settings, refresh_mal_token)
     
     if not anilist_token or not mal_token:
         logger.error("Failed to load tokens after authentication")
@@ -250,7 +257,9 @@ def _execute_sync_unlocked(
     
     # Authenticate if tokens are missing
     if not anilist_token or not mal_token:
-        anilist_token, mal_token = authenticate_services(settings, token_manager)
+        anilist_token, mal_token = authenticate_services(
+            settings, token_manager, anilist_token, mal_token
+        )
         if not anilist_token or not mal_token:
             return False, None
     

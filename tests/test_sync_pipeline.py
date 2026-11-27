@@ -69,7 +69,7 @@ class FakeClient:
     def get_user_anime_list(self, username=None):
         return list(self.entries)
 
-    def update_anime(self, anime_entry):
+    def update_anime(self, anime_entry, *, fields=None):
         self.updates.append(anime_entry)
         return self.update_result
 
@@ -407,7 +407,8 @@ def test_mal_rate_limit_429_retries_then_completes():
                 self.send_header("Retry-After", "0")
                 self.end_headers()
                 return
-            body = json.dumps({"data": [], "paging": {}}).encode()
+            payload = {"name": "tester"} if self.path == "/users/@me" else {"data": [], "paging": {}}
+            body = json.dumps(payload).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -421,10 +422,10 @@ def test_mal_rate_limit_429_retries_then_completes():
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        client = MALClient("test-token", settings=SimpleNamespace(score_sync_mode="auto"))
+        client = MALClient("test-token", settings=SimpleNamespace(score_sync_mode="auto", mal_username="tester"))
         client.base_url = f"http://127.0.0.1:{server.server_port}"
         assert client.get_user_anime_list() == []
-        assert request_count == 2
+        assert request_count == 3
     finally:
         server.shutdown()
         thread.join(timeout=2)
@@ -507,7 +508,7 @@ def test_auth_error_during_sync_refreshes_mal_and_restarts_from_fresh_lists(
             mal_tokens.append(access_token)
             self.entries = mal_entries
 
-        def update_anime(self, anime_entry):
+        def update_anime(self, anime_entry, *, fields=None):
             nonlocal fail_second_entry_once
             self.updates.append(anime_entry)
             update_ids.append(anime_entry.mal_id)
@@ -562,7 +563,7 @@ def test_anilist_auth_error_reauthenticates_only_anilist_and_restarts(tmp_path, 
         def search_anime(self, title, limit=5):
             return [{"id": 70, "title": {"english": title}}]
 
-        def update_anime(self, anime_entry):
+        def update_anime(self, anime_entry, *, fields=None):
             nonlocal fail_once
             self.updates.append(anime_entry)
             if fail_once:
@@ -664,3 +665,49 @@ def test_cli_dry_run_flag_requests_plan_and_prints_json(monkeypatch):
     assert result.exit_code == 0, result.output
     assert calls["dry_run"] is True
     assert json.loads(result.output)["dry_run"] is True
+
+
+@pytest.mark.parametrize(
+    ("source", "mode"),
+    [("anilist", "anilist-to-mal"), ("mal", "mal-to-anilist"), ("mal", "bidirectional")],
+)
+def test_active_rewatch_is_reported_without_writes(tmp_path, source, mode):
+    anilist_entry = entry(7, anilist_id=70)
+    mal_entry = entry(7)
+    active_entry = anilist_entry if source == "anilist" else mal_entry
+    active_entry.is_rewatching = True
+    anilist = FakeClient([anilist_entry])
+    mal = FakeClient([mal_entry])
+
+    result = SyncEngine(anilist, mal, settings=settings(tmp_path)).sync(mode)
+
+    assert result.entries_synced == 0
+    assert result.skipped_conflicts[0].reason == "active rewatch requires review"
+    assert anilist.updates == mal.updates == []
+
+
+def test_anilist_rejects_account_mismatch_before_reading_list(tmp_path, monkeypatch):
+    client = AniListClient("token", settings=settings(tmp_path))
+    queries = []
+
+    def query(document, variables=None):
+        queries.append(document)
+        return {"Viewer": {"name": "different-user"}}
+
+    monkeypatch.setattr(client, "_query", query)
+    with pytest.raises(ValueError, match="belongs to different-user"):
+        client.get_user_anime_list("expected-user")
+    assert queries == ["query { Viewer { name } }"]
+
+
+def test_anilist_note_update_does_not_send_score_or_progress(tmp_path, monkeypatch):
+    client = AniListClient("token", settings=settings(tmp_path))
+    captured = {}
+
+    def capture(document, variables):
+        captured.update(variables)
+        return {"SaveMediaListEntry": {"id": 1}}
+
+    monkeypatch.setattr(client, "_query", capture)
+    assert client.update_anime(entry(7, anilist_id=70), fields=["notes"])
+    assert captured == {"mediaId": 70, "notes": ""}

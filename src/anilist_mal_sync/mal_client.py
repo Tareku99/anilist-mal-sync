@@ -28,15 +28,25 @@ class MALClient(BaseAPIClient):
 
     def get_user_anime_list(self, username: str = "@me") -> list[AnimeEntry]:
         """Fetch user's anime list from MyAnimeList."""
+        expected = username if username != "@me" else self.settings.mal_username
+        profile = self.session.get(f"{self.base_url}/users/@me", timeout=(5, 30))
+        self._handle_auth_error(profile, "MyAnimeList")
+        profile.raise_for_status()
+        account = profile.json().get("name")
+        if not account:
+            raise ValueError("MyAnimeList did not return the authenticated user's name")
+        if expected and expected.casefold() != account.casefold():
+            raise ValueError(f"MyAnimeList token belongs to {account}, expected {expected}")
+        logger.info("Syncing MyAnimeList account %s", account)
         entries = []
-        url = f"{self.base_url}/users/{username}/animelist"
+        url = f"{self.base_url}/users/@me/animelist"
         params = {
-              "fields": "list_status{updated_at},num_episodes,alternative_titles",
+            "fields": "list_status{status,score,num_episodes_watched,is_rewatching,updated_at,comments,num_times_rewatched},num_episodes",
             "limit": 1000,
         }
 
         while url:
-            response = self.session.get(url, params=params)
+            response = self.session.get(url, params=params, timeout=(5, 30))
             self._handle_auth_error(response, "MyAnimeList")
             response.raise_for_status()
             data = response.json()
@@ -79,7 +89,8 @@ class MALClient(BaseAPIClient):
         return AnimeEntry(
             mal_id=node.get("id"),
             title=node.get("title"),
-            status=status_map.get(list_status.get("status"), WatchStatus.WATCHING),
+            status=status_map.get(list_status.get("status"), WatchStatus.UNKNOWN),
+            is_rewatching=list_status.get("is_rewatching") is True,
             score=score,
             episodes_watched=list_status.get("num_episodes_watched", 0),
             total_episodes=node.get("num_episodes"),
@@ -89,7 +100,7 @@ class MALClient(BaseAPIClient):
             updated_at=updated_at,
         )
 
-    def update_anime(self, entry: AnimeEntry) -> bool:
+    def update_anime(self, entry: AnimeEntry, *, fields: list[str] | None = None) -> bool:
         """Update an anime entry on MyAnimeList."""
         if not entry.mal_id:
             logger.warning(f"Cannot update MAL entry without mal_id: {self._safe_title(entry.title)}")
@@ -121,9 +132,19 @@ class MALClient(BaseAPIClient):
 
         data["comments"] = entry.notes or ""
         data["num_times_rewatched"] = entry.rewatched
+        if fields is not None:
+            parameter_names = {
+                "status": "status",
+                "episodes_watched": "num_watched_episodes",
+                "rewatched": "num_times_rewatched",
+                "notes": "comments",
+                "score": "score",
+            }
+            selected = {parameter_names[field] for field in fields}
+            data = {name: value for name, value in data.items() if name in selected}
 
         try:
-            response = self.session.patch(url, data=data)
+            response = self.session.patch(url, data=data, timeout=(5, 30))
             self._handle_auth_error(response, "MyAnimeList")
             response.raise_for_status()
             logger.info(f"Updated MAL entry: {self._safe_title(entry.title)} (episodes: {entry.episodes_watched})")
@@ -139,7 +160,7 @@ class MALClient(BaseAPIClient):
         url = f"{self.base_url}/anime"
         params = {"q": title, "limit": limit}
 
-        response = self.session.get(url, params=params)
+        response = self.session.get(url, params=params, timeout=(5, 30))
         self._handle_auth_error(response, "MyAnimeList")
         response.raise_for_status()
         return response.json().get("data", [])

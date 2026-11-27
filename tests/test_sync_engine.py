@@ -150,5 +150,5 @@ def test_bidirectional_sync_still_propagates_newer_field_changes(sync_clients):
     result = engine.sync("bidirectional")
 
     assert result.success is True
-    mal.update_anime.assert_called_once_with(anilist_entry)
+    mal.update_anime.assert_called_once_with(anilist_entry, fields=["episodes_watched"])
 

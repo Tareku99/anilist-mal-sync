@@ -53,15 +53,16 @@ def main():
     print("[OK] Setup Complete!")
     print("="*60)
     print("\n[NEXT] What to do now:")
-    print("\n1. Create .env file from .env.example:")
+    print("\n1. Create data/config.yaml from config.example.yaml:")
     if is_windows:
-        print("   copy .env.example .env")
+        print("   mkdir data")
+        print("   copy config.example.yaml data\\config.yaml")
     else:
-        print("   cp .env.example .env")
+        print("   mkdir -p data")
+        print("   cp config.example.yaml data/config.yaml")
     
-    print("\n2. Edit .env with your API credentials (all required):")
-    print("   ANILIST_CLIENT_ID, ANILIST_CLIENT_SECRET, ANILIST_USERNAME")
-    print("   MAL_CLIENT_ID, MAL_CLIENT_SECRET, MAL_USERNAME")
+    print("\n2. Edit data/config.yaml with both services' client IDs and secrets.")
+    print("   Usernames are optional and verify which accounts you intend to sync.")
     
     print("\n3. Activate virtual environment:")
     if is_windows:
@@ -71,9 +72,8 @@ def main():
     
     print("\n4. Run commands:")
     print("   anilist-mal-sync auth")
-    print("   anilist-mal-sync sync --mode anilist-to-mal")
-    print("   anilist-mal-sync sync --mode mal-to-anilist")
-    print("   anilist-mal-sync sync --mode bidirectional")
+    print("   anilist-mal-sync run --once --dry-run")
+    print("   anilist-mal-sync run")
     
     print("\n" + "="*60 + "\n")
 

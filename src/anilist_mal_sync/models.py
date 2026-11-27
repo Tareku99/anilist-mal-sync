@@ -15,6 +15,7 @@ class WatchStatus(str, Enum):
     ON_HOLD = "on_hold"
     DROPPED = "dropped"
     PLAN_TO_WATCH = "plan_to_watch"
+    UNKNOWN = "unknown"
 
 
 class AnimeEntry(BaseModel):
@@ -39,6 +40,7 @@ class AnimeEntry(BaseModel):
     # Additional metadata
     notes: Optional[str] = None
     rewatched: int = Field(default=0, ge=0)
+    is_rewatching: bool = False
     is_favorite: bool = Field(default=False)
 
 
