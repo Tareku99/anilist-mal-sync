@@ -37,6 +37,8 @@ ENV/
 config.yaml
 config.yaml.backup
 tokens.json
+.anilist-mal-sync.lock
+sync-history-*.json
 *.log
 
 # Testing

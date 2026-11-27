@@ -72,6 +72,7 @@ sync_status = {
     "last_result": None,
     "total_syncs": 0,
     "preview": None,
+    "last_manual_success": None,
 }
 
 # Threading lock to prevent concurrent syncs
@@ -98,6 +99,8 @@ class SyncStatus(BaseModel):
     last_result: str | None = None
     total_syncs: int
     sync_in_progress: bool = False  # True if any sync (scheduled or manual) is running
+    preview_only: bool = False
+    last_manual_success: bool | None = None
     preview: SyncResult | None = None
 
 
@@ -109,7 +112,7 @@ class ConfigUpdate(BaseModel):
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
     """Main dashboard page"""
-    html_content = """
+    html_content = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -118,25 +121,19 @@ async def dashboard():
     <title>AniList–MAL Sync Dashboard</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        html, body {
-            height: 100%;
-            overflow: hidden;
-        }
+        [hidden] { display: none !important; }
         body {
+            min-height: 100vh;
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%) fixed;
             padding: 15px;
-            overflow-x: hidden;
-            overflow-y: hidden;
             display: flex;
             flex-direction: column;
         }
         .container { 
-            max-width: 95%; 
+            width: min(100%, 1300px);
             margin: 0 auto; 
             padding: 0 10px; 
-            overflow-x: hidden; 
-            overflow-y: hidden;
             flex: 1;
             display: flex;
             flex-direction: column;
@@ -152,14 +149,14 @@ async def dashboard():
         .header p { opacity: 0.9; font-size: 0.95em; }
         .cards {
             display: grid;
-            grid-template-columns: 1fr 2fr;
+            grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
             gap: 20px;
             margin-bottom: 15px;
             flex: 1;
             min-height: 0;
         }
         @media (max-width: 1024px) {
-            .cards { grid-template-columns: 1fr; }
+            .cards { grid-template-columns: minmax(0, 1fr); }
         }
         .card {
             background: white;
@@ -171,10 +168,9 @@ async def dashboard():
             height: fit-content;
         }
         .card.config-card {
-            height: 100%;
+            min-height: 25rem;
             display: flex;
             flex-direction: column;
-            min-height: 0;
         }
         .card h2 {
             color: #667eea;
@@ -184,12 +180,13 @@ async def dashboard():
         .status-item {
             display: flex;
             justify-content: space-between;
+            gap: 0.75rem;
             padding: 10px 0;
             border-bottom: 1px solid #eee;
         }
         .status-item:last-child { border-bottom: none; }
         .status-label { font-weight: 600; color: #555; }
-        .status-value { color: #333; }
+        .status-value { color: #333; text-align: right; overflow-wrap: anywhere; }
         .status-running { color: #10b981; font-weight: bold; }
         .status-stopped { color: #ef4444; font-weight: bold; }
         .btn {
@@ -202,7 +199,6 @@ async def dashboard():
             cursor: pointer;
             font-size: 16px;
             font-weight: 600;
-            transition: background 0.2s;
             width: 100%;
             margin-top: 10px;
         }
@@ -217,7 +213,7 @@ async def dashboard():
         .config-editor {
             width: 100%;
             flex: 1;
-            min-height: 0;
+            min-height: 18rem;
             font-family: 'Courier New', monospace;
             font-size: 15px;
             line-height: 1.6;
@@ -286,7 +282,7 @@ async def dashboard():
             <div class="card">
                 <h2>📊 Status</h2>
                 <div class="status-item">
-                    <span class="status-label">Service:</span>
+                    <span class="status-label">Scheduler:</span>
                     <span class="status-value" id="status-running">Loading...</span>
                 </div>
                 <div class="status-item">
@@ -306,12 +302,14 @@ async def dashboard():
                     <span class="status-value" id="status-last-result">-</span>
                 </div>
                 <div class="status-item">
-                    <span class="status-label">Total Syncs:</span>
+                    <span class="status-label">Total Attempts:</span>
                     <span class="status-value" id="status-total-syncs">0</span>
                 </div>
-                <button class="btn btn-secondary" id="sync-now-btn" onclick="triggerSync(event)">▶️ Sync Now</button>
-                <button class="btn" id="preview-btn" onclick="triggerSync(event, true)">Preview Sync</button>
+                <button class="btn btn-secondary" id="sync-now-btn" onclick="triggerSync(false)" disabled>▶️ Sync Now</button>
+                <button class="btn" id="preview-btn" onclick="triggerSync(true)" disabled>Preview Sync</button>
                 <button class="btn" id="refresh-btn" onclick="refreshStatus()">🔄 Refresh Status</button>
+                <div class="message" id="sync-message" role="status"></div>
+                <div class="message" id="status-message" role="status"></div>
                 <details id="preview-details" hidden>
                     <summary>Last preview</summary>
                     <pre id="preview-content" style="white-space: pre-wrap; max-height: 18rem; overflow: auto"></pre>
@@ -321,11 +319,11 @@ async def dashboard():
             <div class="card config-card">
                 <h2>⚙️ Configuration</h2>
                 <div style="flex: 1; display: flex; flex-direction: column; min-height: 0;">
-                    <textarea class="config-editor" id="config-editor" placeholder="Loading configuration..."></textarea>
+                    <textarea class="config-editor" id="config-editor" aria-label="YAML configuration" placeholder="Loading configuration..." disabled></textarea>
                 </div>
-                <button class="btn" onclick="loadConfig()">📥 Reload Config</button>
-                <button class="btn btn-secondary" onclick="saveConfig()">💾 Save Config</button>
-                <div class="message" id="config-message"></div>
+                <button class="btn" id="reload-config-btn" onclick="loadConfig()">📥 Reload Config</button>
+                <button class="btn btn-secondary" id="save-config-btn" onclick="saveConfig()" disabled>💾 Save Config</button>
+                <div class="message" id="config-message" role="status"></div>
                 <div class="info-note">
                     ℹ️ <strong>Note:</strong> Most configuration changes are automatically reloaded. CLI parameters (interval, port, host) require a manual restart.
                 </div>
@@ -343,140 +341,194 @@ async def dashboard():
     </div>
 
     <script>
-        // Status update function - updates all status fields and button states
-        async function updateStatus() {
-            try {
-                const response = await fetch('/api/status');
-                const data = await response.json();
-                
-                // Update status fields
-                document.getElementById('status-running').textContent = data.running ? 'Running' : 'Stopped';
-                document.getElementById('status-running').className = data.running ? 'status-value status-running' : 'status-value status-stopped';
-                document.getElementById('status-last-sync').textContent = data.last_sync || '-';
-                document.getElementById('status-last-success').textContent = data.last_successful_sync || '-';
-                document.getElementById('status-next-sync').textContent = data.next_sync || '-';
-                document.getElementById('status-last-result').textContent = data.last_result || '-';
-                document.getElementById('status-total-syncs').textContent = data.total_syncs;
-                
-                // Update sync button state
-                const syncBtn = document.getElementById('sync-now-btn');
-                syncBtn.disabled = data.sync_in_progress;
-                syncBtn.textContent = data.sync_in_progress ? '⏳ Syncing...' : '▶️ Sync Now';
-                document.getElementById('preview-btn').disabled = data.sync_in_progress;
-                document.getElementById('preview-details').hidden = !data.preview;
-                if (data.preview) {
-                    const changes = [...data.preview.additions, ...data.preview.updates, ...data.preview.skipped_conflicts];
-                    document.getElementById('preview-content').textContent = changes.map(change => {
+        const byId = (id) => document.getElementById(id);
+        let currentStatus = null;
+        let statusRequest = null;
+        let pollTimer;
+        let action = null;
+        let starting = false;
+        let configBusy = false;
+        let configLoaded = false;
+
+        async function requestJson(url, options = {}) {
+            const response = await fetch(url, {
+                cache: 'no-store', signal: AbortSignal.timeout(10000), ...options
+            });
+            const data = await response.json().catch(() => null);
+            if (!response.ok || !data) {
+                throw new Error(data?.detail || 'Request failed (' + response.status + ')');
+            }
+            return data;
+        }
+
+        function showMessage(id, message, type = '') {
+            const element = byId(id);
+            element.textContent = message;
+            element.className = message ? 'message show ' + type : 'message';
+        }
+
+        function renderButtons() {
+            const busy = Boolean(action || currentStatus?.sync_in_progress);
+            const syncBtn = byId('sync-now-btn');
+            const previewBtn = byId('preview-btn');
+            syncBtn.hidden = Boolean(currentStatus?.preview_only);
+            syncBtn.disabled = !currentStatus || busy;
+            previewBtn.disabled = !currentStatus || busy;
+            syncBtn.textContent = action === 'sync' ? 'Syncing…' : 'Sync Now';
+            previewBtn.textContent = action === 'preview' ? 'Previewing…' : 'Preview Sync';
+        }
+
+        function renderStatus(data) {
+            byId('status-running').textContent = data.running ? 'Running' : 'Inactive';
+            byId('status-running').className = 'status-value ' + (data.running ? 'status-running' : 'status-stopped');
+            byId('status-last-sync').textContent = data.last_sync || '—';
+            byId('status-last-success').textContent = data.last_successful_sync || '—';
+            byId('status-next-sync').textContent = data.next_sync || '—';
+            byId('status-last-result').textContent = data.last_result || '—';
+            byId('status-total-syncs').textContent = data.total_syncs;
+
+            const completed = action && !starting && !data.sync_in_progress ? action : null;
+            if (completed) {
+                action = null;
+                const failed = data.last_manual_success === false;
+                showMessage('sync-message', data.last_result || 'Finished', failed ? 'error' : 'success');
+            } else if (!action && data.sync_in_progress) {
+                showMessage('sync-message', 'A sync is already running.');
+            } else if (!action && currentStatus?.sync_in_progress) {
+                showMessage('sync-message', '');
+            }
+
+            const details = byId('preview-details');
+            details.hidden = !data.preview;
+            if (data.preview) {
+                const lines = [];
+                for (const [label, entries] of [
+                    ['Additions', data.preview.additions], ['Updates', data.preview.updates],
+                    ['Conflicts', data.preview.skipped_conflicts],
+                    ['Other skips', data.preview.skipped.filter(change => change.reason !== 'already in sync')],
+                ]) {
+                    if (!entries.length) continue;
+                    lines.push(label + ' (' + entries.length + ')');
+                    for (const change of entries) {
                         const direction = change.source && change.target ? ' (' + change.source + ' → ' + change.target + ')' : '';
-                        const description = change.reason || JSON.stringify(change.differences);
-                        return change.title + direction + ': ' + description;
-                    }).concat(data.preview.errors).join('\\n') || 'No changes planned.';
+                        const explanation = change.reason || Object.entries(change.differences).map(([field, values]) =>
+                            field + ': ' + JSON.stringify(values.from) + ' → ' + JSON.stringify(values.to)
+                        ).join(', ');
+                        lines.push('• ' + change.title + direction + ': ' + explanation);
+                    }
+                    lines.push('');
                 }
-            } catch (error) {
-                console.error('Failed to fetch status:', error);
+                byId('preview-content').textContent = lines.concat(data.preview.errors).join('\n').trim() || 'No changes planned.';
+                if (completed === 'preview') details.open = true;
             }
         }
 
-        // Refresh status with button feedback
+        function updateStatus() {
+            if (statusRequest) return statusRequest;
+            clearTimeout(pollTimer);
+            statusRequest = (async () => {
+                try {
+                    const data = await requestJson('/api/status');
+                    renderStatus(data);
+                    currentStatus = data;
+                    showMessage('status-message', '');
+                } catch (error) {
+                    showMessage('status-message', 'Could not refresh status. Retrying automatically.', 'error');
+                } finally {
+                    statusRequest = null;
+                    renderButtons();
+                    pollTimer = setTimeout(updateStatus, action || currentStatus?.sync_in_progress ? 700 : 5000);
+                }
+            })();
+            return statusRequest;
+        }
+
         async function refreshStatus() {
-            const btn = document.getElementById('refresh-btn');
-            const originalText = btn.textContent;
-            btn.disabled = true;
-            btn.textContent = '🔄 Refreshing...';
-            
+            const button = byId('refresh-btn');
+            button.disabled = true;
+            button.textContent = 'Refreshing…';
             try {
                 await updateStatus();
             } finally {
-                setTimeout(() => {
-                    btn.disabled = false;
-                    btn.textContent = originalText;
-                }, 300);
+                button.disabled = false;
+                button.textContent = 'Refresh Status';
             }
         }
 
-        // Load configuration
+        function setConfigBusy(operation) {
+            configBusy = Boolean(operation);
+            byId('config-editor').disabled = configBusy || !configLoaded;
+            byId('save-config-btn').disabled = configBusy || !configLoaded;
+            byId('reload-config-btn').disabled = configBusy;
+            byId('reload-config-btn').textContent = operation === 'load' ? 'Loading…' : 'Reload Config';
+            byId('save-config-btn').textContent = operation === 'save' ? 'Saving…' : 'Save Config';
+        }
+
         async function loadConfig() {
+            if (configBusy) return;
+            setConfigBusy('load');
             try {
-                const response = await fetch('/api/config');
-                const data = await response.json();
-                document.getElementById('config-editor').value = data.config;
-                showMessage('config-message', 'Configuration loaded successfully', 'success');
+                const data = await requestJson('/api/config');
+                byId('config-editor').value = data.config;
+                configLoaded = true;
+                showMessage('config-message', '');
             } catch (error) {
-                showMessage('config-message', 'Failed to load configuration', 'error');
+                showMessage('config-message', 'Could not load configuration: ' + error.message, 'error');
+            } finally {
+                setConfigBusy(null);
             }
         }
 
-        // Save configuration
         async function saveConfig() {
-            const config = document.getElementById('config-editor').value;
+            if (configBusy || !configLoaded) return;
+            setConfigBusy('save');
             try {
-                const response = await fetch('/api/config', {
+                await requestJson('/api/config', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'X-Sync-Dashboard': '1' },
-                    body: JSON.stringify({ config }),
+                    body: JSON.stringify({ config: byId('config-editor').value })
                 });
-                
-                if (!response.ok) {
-                    const error = await response.json();
-                    throw new Error(error.detail || 'Failed to save config');
-                }
-                
-                showMessage('config-message', 'Configuration saved successfully! It will be reloaded automatically.', 'success');
+                // Reload the masked version so pasted secrets do not stay in the editor.
+                byId('config-editor').value = '';
+                configLoaded = false;
+                setConfigBusy(null);
+                await loadConfig();
+                if (configLoaded) showMessage('config-message', 'Configuration saved.', 'success');
+                else showMessage('config-message', 'Configuration saved. Reload the editor to see it.', 'error');
             } catch (error) {
                 showMessage('config-message', error.message, 'error');
+            } finally {
+                setConfigBusy(null);
             }
         }
 
-        // Trigger manual sync
-        async function triggerSync(event, preview = false) {
-            if (event) {
-                event.preventDefault();
-                event.stopPropagation();
-            }
-            
-            const btn = document.getElementById('sync-now-btn');
-            if (btn.disabled) return;
-            
-            btn.disabled = true;
-            btn.textContent = '⏳ Syncing...';
-            
+        async function triggerSync(preview) {
+            if (action || !currentStatus || currentStatus.sync_in_progress) return;
+            action = preview ? 'preview' : 'sync';
+            starting = true;
+            renderButtons();
+            showMessage('sync-message', preview ? 'Preparing preview…' : 'Starting sync…');
+            if (preview) byId('preview-details').hidden = true;
+
             try {
-                const response = await fetch('/api/sync/trigger?preview=' + preview, {
+                await requestJson('/api/sync/trigger?preview=' + preview, {
                     method: 'POST', headers: { 'X-Sync-Dashboard': '1' }
                 });
-                if (!response.ok) {
-                    const error = await response.json();
-                    throw new Error(error.detail || 'Sync failed');
-                }
-                
-                // Poll for completion
-                const checkInterval = setInterval(async () => {
-                    await updateStatus();
-                    const statusResponse = await fetch('/api/status');
-                    const statusData = await statusResponse.json();
-                    if (!statusData.sync_in_progress) {
-                        clearInterval(checkInterval);
-                    }
-                }, 1000);
+                if (statusRequest) await statusRequest;
+                starting = false;
+                await updateStatus();
             } catch (error) {
-                console.error('Failed to trigger sync:', error);
-                await updateStatus(); // Restore button state
+                action = null;
+                starting = false;
+                showMessage('sync-message', error.message, 'error');
+                renderButtons();
+                await updateStatus();
             }
         }
 
-        // Show message
-        function showMessage(elementId, message, type) {
-            const msgEl = document.getElementById(elementId);
-            msgEl.textContent = message;
-            msgEl.className = `message ${type} show`;
-            setTimeout(() => msgEl.classList.remove('show'), 5000);
-        }
-
-        // Initialize on page load
         window.addEventListener('DOMContentLoaded', () => {
             updateStatus();
             loadConfig();
-            setInterval(updateStatus, 30000); // Auto-refresh every 30 seconds
         });
     </script>
 </body>
@@ -488,8 +540,16 @@ async def dashboard():
 @app.get("/api/status")
 async def get_status() -> SyncStatus:
     """Get current sync status"""
+    in_progress = is_sync_running()
     status_dict = sync_status.copy()
-    status_dict["sync_in_progress"] = is_sync_running()
+    status_dict["sync_in_progress"] = in_progress
+    status_dict["preview_only"] = bool(_cli_dry_run)
+    if not status_dict["preview_only"]:
+        try:
+            status_dict["preview_only"] = get_settings().dry_run
+        except (OSError, ValueError, TypeError, yaml.YAMLError):
+            # Keep status and config editing available while configuration is invalid.
+            pass
     return SyncStatus(**status_dict)
 
 
@@ -555,12 +615,15 @@ async def trigger_sync(preview: bool = False):
         settings = get_settings()
         mode = _cli_sync_mode if _cli_sync_mode else settings.sync_mode
         dry_run = preview or bool(_cli_dry_run) or settings.dry_run
+        if dry_run:
+            sync_status["preview"] = None
+        sync_status["last_manual_success"] = None
         
         def run_manual_sync():
             try:
                 logger.info(f"[INFO] Manual sync started (mode: {mode})")
-                update_sync_status(running=True)
                 success, result = execute_sync(mode, dry_run=dry_run, settings=settings)
+                sync_status["last_manual_success"] = bool(success and result and result.success)
                 if dry_run:
                     sync_status["preview"] = result
                 
@@ -606,6 +669,7 @@ async def trigger_sync(preview: bool = False):
                         last_result=result_msg
                     )
             except Exception as e:
+                sync_status["last_manual_success"] = False
                 logger.error(f"[ERROR] Manual sync failed: {e}")
                 update_sync_status(
                     last_sync=time.strftime('%Y-%m-%d %H:%M:%S %Z'),
