@@ -24,6 +24,7 @@
   <Requires/>
   <Config Name="OAuth Port" Target="18080" Default="18080" Mode="tcp" Description="OAuth callback port for authentication" Type="Port" Display="always" Required="true" Mask="false">18080</Config>
   <Config Name="Web UI Port" Target="23080" Default="23080" Mode="tcp" Description="Web UI dashboard port" Type="Port" Display="always" Required="true" Mask="false">23080</Config>
-  <Config Name="Data Directory" Target="/app/data" Default="/mnt/user/appdata/anilist-mal-sync" Mode="rw" Description="Contains config.yaml and tokens.json" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/anilist-mal-sync</Config>
+  <Config Name="Data Directory" Target="/app/data" Default="/mnt/user/appdata/anilist-mal-sync" Mode="rw" Description="Stores configuration, OAuth tokens, and sync history. Keep this mapping when upgrading." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/anilist-mal-sync</Config>
+  <Config Name="Dashboard Password" Target="SYNC_DASHBOARD_PASSWORD" Default="" Mode="" Description="Optional password for the dashboard. Sign in as admin. Use HTTPS or a trusted VPN for access over the network." Type="Variable" Display="always" Required="false" Mask="true"/>
   <Config Name="Timezone" Target="TZ" Default="America/Boise" Mode="" Description="Container timezone (e.g., America/New_York, Europe/London, Asia/Tokyo)" Type="Variable" Display="always" Required="false" Mask="false">America/Boise</Config>
 </Container>

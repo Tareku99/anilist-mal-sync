@@ -75,6 +75,6 @@ When deploying or using this project:
 
 ### Web UI Security
 - **Local Access**: The example Compose file publishes the dashboard on localhost.
-- **LAN or Unraid Access**: Set `SYNC_DASHBOARD_PASSWORD` in the container environment to require HTTP Basic authentication on the dashboard. Sign in as `admin`. Use a reverse proxy with HTTPS before using this password over the network, or keep access behind a trusted VPN.
+- **LAN or Unraid Access**: Set **Dashboard Password** in the Unraid template or set `SYNC_DASHBOARD_PASSWORD` in the container environment to require HTTP Basic authentication. Sign in as `admin`. Use a reverse proxy with HTTPS before using this password over the network, or keep access behind a trusted VPN.
 - **Configuration Secrets**: The dashboard masks stored client secrets. Leave the placeholder in place to preserve the saved secret, or replace it with the new value when rotating credentials.
 - **Configuration Editing**: The web UI can edit `config.yaml` - ensure proper access controls
