@@ -32,11 +32,13 @@ class MALClient(BaseAPIClient):
         profile = self.session.get(f"{self.base_url}/users/@me", timeout=(5, 30))
         self._handle_auth_error(profile, "MyAnimeList")
         profile.raise_for_status()
-        account = profile.json().get("name")
+        identity = profile.json()
+        account = identity.get("name")
         if not account:
             raise ValueError("MyAnimeList did not return the authenticated user's name")
         if expected and expected.casefold() != account.casefold():
             raise ValueError(f"MyAnimeList token belongs to {account}, expected {expected}")
+        self.account_key = str(identity.get("id") or account.casefold())
         logger.info("Syncing MyAnimeList account %s", account)
         entries = []
         url = f"{self.base_url}/users/@me/animelist"

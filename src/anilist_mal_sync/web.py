@@ -10,9 +10,9 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Optional
-import yaml
+from typing import Annotated
 
+import yaml
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -29,7 +29,8 @@ _SECRET_MASK = "<stored secret>"
 
 
 def _check_dashboard_access(
-    request: Request, credentials: HTTPBasicCredentials | None = Depends(_basic_auth)
+    request: Request,
+    credentials: Annotated[HTTPBasicCredentials | None, Depends(_basic_auth)],
 ):
     password = os.environ.get("SYNC_DASHBOARD_PASSWORD")
     if password and (
@@ -66,6 +67,7 @@ def _mask_config_secrets(config: dict, existing: dict | None = None) -> None:
 sync_status = {
     "running": False,
     "last_sync": None,
+    "last_successful_sync": None,
     "next_sync": None,
     "last_result": None,
     "total_syncs": 0,
@@ -90,9 +92,10 @@ def _get_config_path() -> Path:
 class SyncStatus(BaseModel):
     """Sync status response model"""
     running: bool
-    last_sync: Optional[str] = None
-    next_sync: Optional[str] = None
-    last_result: Optional[str] = None
+    last_sync: str | None = None
+    last_successful_sync: str | None = None
+    next_sync: str | None = None
+    last_result: str | None = None
     total_syncs: int
     sync_in_progress: bool = False  # True if any sync (scheduled or manual) is running
     preview: SyncResult | None = None
@@ -287,8 +290,12 @@ async def dashboard():
                     <span class="status-value" id="status-running">Loading...</span>
                 </div>
                 <div class="status-item">
-                    <span class="status-label">Last Sync:</span>
+                    <span class="status-label">Last Attempt:</span>
                     <span class="status-value" id="status-last-sync">-</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Last Successful Sync:</span>
+                    <span class="status-value" id="status-last-success">-</span>
                 </div>
                 <div class="status-item">
                     <span class="status-label">Next Sync:</span>
@@ -346,6 +353,7 @@ async def dashboard():
                 document.getElementById('status-running').textContent = data.running ? 'Running' : 'Stopped';
                 document.getElementById('status-running').className = data.running ? 'status-value status-running' : 'status-value status-stopped';
                 document.getElementById('status-last-sync').textContent = data.last_sync || '-';
+                document.getElementById('status-last-success').textContent = data.last_successful_sync || '-';
                 document.getElementById('status-next-sync').textContent = data.next_sync || '-';
                 document.getElementById('status-last-result').textContent = data.last_result || '-';
                 document.getElementById('status-total-syncs').textContent = data.total_syncs;
@@ -498,9 +506,9 @@ async def get_config():
         return {"config": yaml.safe_dump(config, sort_keys=False)}
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Failed to load config: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except (OSError, ValueError, TypeError, AttributeError, yaml.YAMLError):
+        logger.error("Failed to load dashboard configuration")
+        raise HTTPException(status_code=500, detail="Could not read configuration")
 
 
 @app.post("/api/config")
@@ -579,7 +587,8 @@ async def trigger_sync(preview: bool = False):
                     
                     update_sync_status(
                         last_sync=time.strftime('%Y-%m-%d %H:%M:%S %Z'),
-                        last_result=result_msg
+                        last_result=result_msg,
+                        successful=result.success and not result.dry_run,
                     )
                 else:
                     if result is not None:
@@ -613,13 +622,18 @@ async def trigger_sync(preview: bool = False):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def update_sync_status(running: bool = None, last_sync: str = None, 
-                       next_sync: str = None, last_result: str = None):
+def update_sync_status(
+    running: bool | None = None, last_sync: str | None = None,
+    next_sync: str | None = None, last_result: str | None = None,
+    successful: bool = False,
+):
     """Update the global sync status (called from CLI)"""
     if running is not None:
         sync_status["running"] = running
     if last_sync:
         sync_status["last_sync"] = last_sync
+        if successful:
+            sync_status["last_successful_sync"] = last_sync
     if next_sync:
         sync_status["next_sync"] = next_sync
     if last_result:

@@ -11,7 +11,7 @@ This is a clean-room rewrite in Python with a fresh codebase and architecture.
 
 ## Features
 
-- **Bidirectional sync** with deterministic conflict handling (newer update wins; ambiguous conflicts are reported and skipped)
+- **Bidirectional sync** with field-level conflict handling and review for ambiguous changes
 - **One-way sync modes**: AniList → MAL or MAL → AniList
 - **OAuth authentication** for both services
 - **Docker deployment** with auto-configuration
@@ -218,9 +218,11 @@ sync:
 
 `run --once --dry-run` fetches both lists, plans the same additions and updates as a normal sync, and prints a JSON summary with `additions`, `updates`, `skipped_conflicts`, and `skipped`. Each change includes its direction, IDs, affected fields, and before/after values. The plan is sorted by MAL ID so repeated runs over unchanged lists produce stable output. Dry-run never calls list-update endpoints; OAuth may still refresh or request tokens so the lists can be read.
 
-In bidirectional mode, a strictly newer update timestamp wins. If timestamps are equal or either timestamp is missing, differing statuses are reported as conflicts and skipped. When timestamps are unavailable, only a higher episode count with the same status and no other differing fields is merged automatically.
+Bidirectional sync records agreed values for each pair of accounts in the token directory. A field changed on one side since the last agreement can sync independently of other fields. Conflicting changes and first-run disagreements are reported for review. If an entry previously seen on both lists disappears from one list, sync reports it and skips re-adding it. Dry runs leave this history untouched.
 
 Both lists are read from the accounts that own the access tokens. If you configure usernames, they must match those accounts. Active rewatches and unrecognized statuses are reported as conflicts pending verification of rewatch progress and status conversion.
+
+When searching AniList for an entry from MAL, sync only adds the entry if the search result confirms its MAL ID. Same-title candidates without a verified ID are shown for review.
 
 Sync runs use an OS-backed lock in the configured token directory, preventing separate local processes that share that directory from syncing at the same time. AniList and MAL do not provide conditional list writes here, so an external edit made after the lists are fetched can still race with a pending update.
 

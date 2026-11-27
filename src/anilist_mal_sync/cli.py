@@ -383,7 +383,8 @@ def run(mode: str | None, dry_run: bool, interval: int | None, log_level: str, o
                                 update_sync_status(
                                     running=True,
                                     last_sync=time.strftime('%Y-%m-%d %H:%M:%S %Z'),
-                                    last_result=f"{result.entries_synced}/{total} synced, 0 failed, {conflicts} conflicts"
+                                    last_result=f"{result.entries_synced}/{total} synced, 0 failed, {conflicts} conflicts",
+                                    successful=True,
                                 )
                             elif result.entries_synced > 0:
                                 logger.warning(f"Sync run #{run_count} completed: {result.entries_synced}/{total} synced, {result.entries_failed} failed")

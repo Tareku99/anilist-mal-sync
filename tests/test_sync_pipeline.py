@@ -321,7 +321,7 @@ def test_anilist_search_failure_is_counted_not_reported_as_no_match(tmp_path, mo
     assert anilist.updates == []
 
 
-def test_mal_only_entry_is_matched_to_unique_exact_anilist_title(tmp_path, monkeypatch):
+def test_title_only_anilist_candidate_is_reported_for_review(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "anilist_mal_sync.sync_engine.get_settings",
         lambda: settings(tmp_path),
@@ -338,9 +338,8 @@ def test_mal_only_entry_is_matched_to_unique_exact_anilist_title(tmp_path, monke
         settings=settings(tmp_path),
     ).sync("bidirectional")
 
-    assert len(result.additions) == 1
-    assert result.additions[0].source == "mal"
-    assert result.additions[0].anilist_id == 70
+    assert result.additions == []
+    assert "AniList ID 70" in result.skipped_conflicts[0].reason
     assert anilist.updates == []
     assert mal.updates == []
 
@@ -438,6 +437,7 @@ def test_anilist_rate_limit_429_retries_graphql_post():
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             nonlocal request_count
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
             request_count += 1
             if request_count == 1:
                 self.send_response(429)
@@ -561,7 +561,7 @@ def test_anilist_auth_error_reauthenticates_only_anilist_and_restarts(tmp_path, 
             anilist_tokens.append(access_token)
 
         def search_anime(self, title, limit=5):
-            return [{"id": 70, "title": {"english": title}}]
+            return [{"id": 70, "idMal": 7, "title": {"english": title}}]
 
         def update_anime(self, anime_entry, *, fields=None):
             nonlocal fail_once
@@ -697,7 +697,7 @@ def test_anilist_rejects_account_mismatch_before_reading_list(tmp_path, monkeypa
     monkeypatch.setattr(client, "_query", query)
     with pytest.raises(ValueError, match="belongs to different-user"):
         client.get_user_anime_list("expected-user")
-    assert queries == ["query { Viewer { name } }"]
+    assert queries == ["query { Viewer { id name } }"]
 
 
 def test_anilist_note_update_does_not_send_score_or_progress(tmp_path, monkeypatch):
@@ -711,3 +711,28 @@ def test_anilist_note_update_does_not_send_score_or_progress(tmp_path, monkeypat
     monkeypatch.setattr(client, "_query", capture)
     assert client.update_anime(entry(7, anilist_id=70), fields=["notes"])
     assert captured == {"mediaId": 70, "notes": ""}
+
+
+def test_bidirectional_history_merges_independent_fields_and_suppresses_readdition(tmp_path):
+    anilist = FakeClient([entry(7, anilist_id=70, episodes=2)])
+    mal = FakeClient([entry(7, episodes=2)])
+    anilist.account_key, mal.account_key = "1", "2"
+
+    def sync(dry_run=False):
+        return SyncEngine(
+            anilist, mal, dry_run=dry_run, settings=settings(tmp_path),
+            history_directory=tmp_path,
+        ).sync("bidirectional")
+
+    assert sync().entries_synced == 0
+    anilist.entries[0].episodes_watched = 3
+    mal.entries[0].notes = "MAL edit"
+    preview = sync(dry_run=True)
+    assert [(change.target, change.fields) for change in preview.updates] == [
+        ("mal", ["episodes_watched"]), ("anilist", ["notes"]),
+    ]
+    assert sync().entries_synced == 2
+    mal.entries.clear()
+    result = sync()
+    assert result.additions == []
+    assert "disappeared" in result.skipped_conflicts[0].reason

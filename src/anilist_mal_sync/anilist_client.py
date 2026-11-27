@@ -64,12 +64,13 @@ class AniListClient(BaseAPIClient):
 
     def get_user_anime_list(self, username: Optional[str] = None) -> list[AnimeEntry]:
         """Fetch user's anime list from AniList."""
-        viewer = self._query("query { Viewer { name } }").get("Viewer")
+        viewer = self._query("query { Viewer { id name } }").get("Viewer")
         account = viewer.get("name") if viewer else None
         if not account:
             raise ValueError("AniList did not return the authenticated user's name")
         if username and username.casefold() != account.casefold():
             raise ValueError(f"AniList token belongs to {account}, expected {username}")
+        self.account_key = str(viewer.get("id") or account.casefold())
         username = account
         logger.info("Syncing AniList account %s", username)
 

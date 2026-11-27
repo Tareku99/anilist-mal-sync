@@ -275,6 +275,7 @@ def _execute_sync_unlocked(
                 mal_client,
                 dry_run=dry_run,
                 settings=settings,
+                history_directory=settings.token_file.parent,
             )
             result = engine.sync(mode)
             result.entries_synced += successful_writes_before_retry

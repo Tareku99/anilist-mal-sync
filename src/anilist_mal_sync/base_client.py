@@ -49,6 +49,8 @@ class BaseAPIClient:
         # Configure retry strategy for rate limits (429)
         retry_strategy = BoundedRetry(
             total=3,
+            read=0,
+            other=0,
             backoff_factor=1,
             status_forcelist=[HTTP_TOO_MANY_REQUESTS],
             allowed_methods=["GET", "POST", "PATCH", "PUT", "DELETE"]

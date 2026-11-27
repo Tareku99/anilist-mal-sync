@@ -3,11 +3,14 @@
 import logging
 from collections import defaultdict
 from datetime import datetime, timezone
+from hashlib import sha256
+from pathlib import Path
 from typing import Literal
 
 from .base_client import AuthenticationError
 from .config import Settings, get_settings
 from .models import AnimeEntry, SyncChange, SyncResult, WatchStatus
+from .sync_history import SyncHistory
 
 logger = logging.getLogger(__name__)
 
@@ -25,12 +28,14 @@ class SyncEngine:
         mal_client,
         dry_run: bool = False,
         settings: Settings | None = None,
+        history_directory: Path | None = None,
     ):
         """Initialize the engine with API clients and an optional settings snapshot."""
         self.anilist = anilist_client
         self.mal = mal_client
         self.dry_run = dry_run
         self.settings = settings or get_settings()
+        self.history_directory = history_directory
 
     @staticmethod
     def _safe_title(title: str) -> str:
@@ -143,6 +148,8 @@ class SyncEngine:
         if differences is None and fields:
             source_values = self._entry_values(entry)
             target_values = self._entry_values(target_entry) if target_entry else {}
+            if target == "mal" and "score" in fields:
+                source_values["score"] = self._normalize_score_for_mal(entry.score)
             differences = {
                 field: {
                     "from": target_values.get(field),
@@ -209,13 +216,15 @@ class SyncEngine:
         source: Platform,
         target: Platform,
         target_client,
+        fields: list[str] | None = None,
     ) -> None:
         if self._skip_unsupported_status(result, source_entry, target_entry):
             return
         operation = "addition" if target_entry is None else "update"
-        fields = list(self.SYNC_FIELDS) if target_entry is None else self._changed_fields(
-            source_entry, target_entry
-        )
+        if fields is None:
+            fields = list(self.SYNC_FIELDS) if target_entry is None else self._changed_fields(
+                source_entry, target_entry
+            )
         if self.settings.score_sync_mode != "auto":
             fields = [field for field in fields if field != "score"]
         if target_entry is not None and not fields:
@@ -389,7 +398,7 @@ class SyncEngine:
     def _find_anilist_id(
         self, title: str, mal_id: int | None = None
     ) -> tuple[int | None, str, bool]:
-        """Prefer an exact MAL ID, then use a unique exact title without ID conflicts."""
+        """Require an exact MAL ID and report unverified title matches for review."""
         matches = self.anilist.search_anime(title, limit=10)
         candidates = [match for match in matches if match.get("id") is not None]
 
@@ -415,7 +424,7 @@ class SyncEngine:
             ):
                 exact_ids.add(match["id"])
         if len(exact_ids) == 1:
-            return exact_ids.pop(), "", False
+            return None, f"title matches AniList ID {exact_ids.pop()} without a verified MAL ID", True
         if len(exact_ids) > 1:
             return None, "multiple exact AniList title matches", True
         return None, "no exact AniList title match", False
@@ -441,6 +450,7 @@ class SyncEngine:
         username = self.settings.anilist_username or None
         anilist_entries = self.anilist.get_user_anime_list(username)
         mal_entries = self.mal.get_user_anime_list()
+        history = self._load_history()
         anilist_groups = self._group_by_mal_id(anilist_entries)
         mal_groups = self._group_by_mal_id(mal_entries)
         reserved_anilist_ids = {
@@ -470,6 +480,14 @@ class SyncEngine:
 
             anilist_entry = anilist_matches[0] if anilist_matches else None
             mal_entry = mal_matches[0] if mal_matches else None
+            previous = history.values(mal_id) if history is not None else None
+            if previous is not None and (anilist_entry is None or mal_entry is None):
+                self._skip(
+                    result, anilist_entry or mal_entry,
+                    "entry disappeared from one list after being seen on both",
+                    conflict=True,
+                )
+                continue
             if anilist_entry is not None and mal_entry is None:
                 self._apply(
                     result,
@@ -507,10 +525,70 @@ class SyncEngine:
                     self.anilist,
                 )
             elif anilist_entry is not None and mal_entry is not None:
-                self._resolve_conflict(result, anilist_entry, mal_entry)
+                if history is None:
+                    self._resolve_conflict(result, anilist_entry, mal_entry)
+                else:
+                    self._resolve_from_history(result, anilist_entry, mal_entry, history, mal_id)
 
+        if history is not None and not self.dry_run:
+            history.save()
         result.success = result.entries_failed == 0
         return result
+
+    def _load_history(self) -> SyncHistory | None:
+        if self.history_directory is None:
+            return None
+        accounts = (getattr(self.anilist, "account_key", None), getattr(self.mal, "account_key", None))
+        if not all(isinstance(account, str) for account in accounts):
+            return None
+        pair = sha256(repr(accounts).encode()).hexdigest()
+        return SyncHistory(self.history_directory / f"sync-history-{pair}.json", accounts)
+
+    def _history_values(self, entry: AnimeEntry) -> dict[str, object]:
+        values = self._entry_values(entry)
+        values["notes"] = entry.notes or ""
+        if "score" in values:
+            values["score"] = self._normalize_score_for_mal(entry.score)
+        return values
+
+    def _resolve_from_history(
+        self, result: SyncResult, anilist: AnimeEntry, mal: AnimeEntry,
+        history: SyncHistory, mal_id: int,
+    ) -> None:
+        if self._skip_unsupported_status(result, anilist, mal):
+            history.remember(mal_id, {})
+            return
+        previous = history.values(mal_id) or {}
+        al_values = self._history_values(anilist)
+        mal_values = self._history_values(mal)
+        to_mal, to_anilist, conflicts = [], [], []
+        agreed = {}
+        for field, al_value in al_values.items():
+            mal_value = mal_values[field]
+            if al_value == mal_value:
+                agreed[field] = al_value
+            elif field not in previous:
+                conflicts.append(field)
+            elif mal_value == previous[field]:
+                to_mal.append(field)
+            elif al_value == previous[field]:
+                to_anilist.append(field)
+            else:
+                conflicts.append(field)
+        history.remember(mal_id, agreed)
+        if conflicts:
+            self._skip(
+                result, anilist, "values disagree without a clear change from the last agreement",
+                conflict=True, fields=conflicts,
+                differences=self._conflict_differences(anilist, mal, conflicts),
+            )
+        if to_mal:
+            self._apply(result, anilist, mal, "anilist", "mal", self.mal, fields=to_mal)
+        if to_anilist:
+            prepared = mal.model_copy(update={"anilist_id": anilist.anilist_id})
+            self._apply(result, prepared, anilist, "mal", "anilist", self.anilist, fields=to_anilist)
+        if not (conflicts or to_mal or to_anilist):
+            self._skip(result, anilist, "already in sync")
 
     def _conflict_differences(
         self,
