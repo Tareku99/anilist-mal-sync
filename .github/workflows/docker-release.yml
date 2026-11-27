@@ -1,5 +1,5 @@
 name: Docker Release
-run-name: "${{ github.event_name == 'workflow_dispatch' && format('Beta • {0}', inputs.branch) || github.event_name == 'pull_request' && format('PR #{0} • {1}', github.event.number, github.head_ref) || format('Production • {0}', github.ref_name) }}"
+run-name: "${{ github.event_name == 'workflow_dispatch' && format('Beta • {0}', github.ref_name) || github.event_name == 'pull_request' && format('PR #{0} • {1}', github.event.number, github.head_ref) || format('Production • {0}', github.ref_name) }}"
 
 on:
   pull_request:
@@ -7,11 +7,6 @@ on:
     branches: [main]
     tags: ['v*']
   workflow_dispatch:
-    inputs:
-      branch:
-        description: Branch to publish as beta (run this workflow from main)
-        required: true
-        type: string
 
 permissions:
   contents: read
@@ -29,10 +24,7 @@ jobs:
     steps:
       - name: Check out application source
         id: source
-        uses: Tareku99/.github/.github/actions/checkout-source@9b06ea2f760ae88d61a247d2104851fcc44536bd
-        with:
-          branch: ${{ inputs.branch || '' }}
-          default-branch: ${{ github.event.repository.default_branch }}
+        uses: Tareku99/.github/.github/actions/checkout-source@3b57590c021160231d4e0c39ac29eb35bdd5d36a
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -54,7 +46,7 @@ jobs:
         with:
           test-outcome: ${{ steps.test.outcome }}
           source-sha: ${{ steps.source.outputs.source-sha }}
-          source-ref: ${{ inputs.branch || github.head_ref || github.ref_name }}
+          source-ref: ${{ github.head_ref || github.ref_name }}
           junit: test-results.xml
 
   build:
@@ -75,19 +67,108 @@ jobs:
     permissions:
       contents: read
       packages: write
-    uses: Tareku99/.github/.github/workflows/docker-publish.yml@1a6c2853f568baecbb6d099f9f0860c670ad7109
+    uses: Tareku99/.github/.github/workflows/docker-publish.yml@3b57590c021160231d4e0c39ac29eb35bdd5d36a
     with:
       image: ghcr.io/tareku99/anilist-mal-sync
       source_image: local-build:ci-${{ github.run_id }}-${{ github.run_attempt }}
       source_sha: ${{ needs.test.outputs.source_sha }}
-      beta_branch: ${{ inputs.branch || '' }}
       include_sha_tag: true
     secrets:
       ghcr_token: ${{ secrets.GITHUB_TOKEN }}
 
+  version-tag:
+    name: Tag version bump
+    needs: [test, publish]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Check out tested commit and history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.test.outputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Determine whether the version increased
+        id: version
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          python3 <<'PY'
+          import os
+          import re
+          import subprocess
+          import tomllib
+          from pathlib import Path
+
+          previous_file = subprocess.check_output(
+              ["git", "show", f"{os.environ['BEFORE']}:pyproject.toml"], text=True
+          )
+          previous = tomllib.loads(previous_file)["project"]["version"]
+          current = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+          if current == previous:
+              print(f"Version {current} is unchanged.")
+              raise SystemExit(0)
+
+          def version_tuple(value):
+              if not re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", value):
+                  raise SystemExit("Automatic tagging requires a MAJOR.MINOR.PATCH version.")
+              return tuple(map(int, value.split(".")))
+
+          if version_tuple(current) <= version_tuple(previous):
+              raise SystemExit(f"Project version must increase: {previous} → {current}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"tag=v{current}", file=output)
+          PY
+
+      - name: Create or verify the Git version tag
+        if: steps.version.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.test.outputs.source_sha }}
+          VERSION_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if existing=$(git rev-parse --verify "refs/tags/$VERSION_TAG^{commit}" 2>/dev/null); then
+            if [[ "$existing" != "$SOURCE_SHA" ]]; then
+              echo "::error::$VERSION_TAG already points to a different commit."
+              exit 1
+            fi
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f "ref=refs/tags/$VERSION_TAG" -f "sha=$SOURCE_SHA" --silent
+          fi
+
+      - name: Tag the published image by digest
+        if: steps.version.outputs.tag != ''
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          IMAGE: ghcr.io/tareku99/anilist-mal-sync
+          IMAGE_DIGEST: ${{ needs.publish.outputs.digest }}
+          VERSION_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          trap 'docker logout ghcr.io' EXIT
+          if existing=$(docker buildx imagetools inspect "$IMAGE:$VERSION_TAG" --format '{{.Manifest.Digest}}' 2>/dev/null); then
+            if [[ "$existing" != "$IMAGE_DIGEST" ]]; then
+              echo "::error::$IMAGE:$VERSION_TAG already points to a different image."
+              exit 1
+            fi
+          else
+            docker buildx imagetools create --prefer-index=false \
+              --tag "$IMAGE:$VERSION_TAG" "$IMAGE@$IMAGE_DIGEST"
+          fi
+          [[ "$(docker buildx imagetools inspect "$IMAGE:$VERSION_TAG" --format '{{.Manifest.Digest}}')" == "$IMAGE_DIGEST" ]]
+          printf 'Published `%s:%s` at `%s`.\n' "$IMAGE" "$VERSION_TAG" "$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
   summary:
     name: Workflow summary
-    needs: [test, build, publish]
+    needs: [test, build, publish, version-tag]
     if: always()
     runs-on: ubuntu-24.04
     permissions: {}
@@ -97,6 +178,6 @@ jobs:
         with:
           jobs: ${{ toJSON(needs) }}
           source-sha: ${{ needs.test.outputs.source_sha }}
-          source-ref: ${{ inputs.branch || github.head_ref || github.ref_name }}
+          source-ref: ${{ github.head_ref || github.ref_name }}
           channel: ${{ github.event_name == 'pull_request' && 'CI' || github.event_name == 'workflow_dispatch' && 'Beta' || 'Production' }}
           image: ghcr.io/tareku99/anilist-mal-sync

@@ -147,7 +147,11 @@ Set the Compose service image to `anilist-mal-sync:local` and run `docker compos
 
 ## Image releases
 
-Pull requests run tests and build the image without publishing. Merges to `main` and eligible version tags publish to GHCR. To publish a beta, run **Actions → Docker Release** from `main` and enter the source branch in the **branch** input. Preview releases use `:beta` and `:beta-<commit>`; production installs use `:latest`.
+Pull requests run tests and build the image without publishing. Each push or merge to `main` publishes `:latest`, `:main`, and a `:sha-<commit>` tag to GHCR.
+
+To publish a beta, open **Actions → Docker Release → Run workflow** and select a branch other than `main`. The selected branch needs the updated workflow. The image is published as `:beta` and `:beta-<commit>`.
+
+For a versioned release, increase `[project].version` in `pyproject.toml` as part of the release PR. Once the change reaches `main` and the tested image publishes successfully, the same workflow creates the Git tag (for example, `v0.2.0`) and points the matching Docker tag to that image's digest. If tagging fails after image publishing, rerun the failed job. Existing version tags cannot be moved by this job.
 
 ## Available Commands
 
