@@ -9,8 +9,8 @@
   <Privileged>false</Privileged>
   <Support>https://github.com/Tareku99/anilist-mal-sync/issues</Support>
   <Project>https://github.com/Tareku99/anilist-mal-sync</Project>
-  <Overview>Bidirectional sync service between AniList and MyAnimeList with OAuth authentication, conflict resolution, and Docker deployment.</Overview>
-  <Description>Sync your anime lists between AniList and MyAnimeList with support for bidirectional sync, conflict resolution (latest update wins), one-way sync modes, automatic rate limiting and retry, plus a built-in web UI for monitoring and configuration management.</Description>
+  <Overview>AniList–MAL Sync keeps your AniList and MyAnimeList anime lists in sync with OAuth authentication, conflict resolution, and Docker deployment.</Overview>
+  <Description>Sync your anime lists between AniList and MyAnimeList with bidirectional or one-way sync, field-level conflict handling, automatic rate limiting and retry, and a dashboard for monitoring and configuration.</Description>
   <Category>Tools:Utilities</Category>
   <WebUI>http://[IP]:[PORT:23080]</WebUI>
   <TemplateURL>https://raw.githubusercontent.com/Tareku99/anilist-mal-sync/main/anilist-mal-sync.xml</TemplateURL>

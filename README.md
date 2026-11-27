@@ -1,4 +1,4 @@
-# AniList ⇄ MyAnimeList Sync
+# AniList–MAL Sync
 
 [![Docker](https://img.shields.io/badge/docker-ghcr.io-blue)](https://github.com/Tareku99/anilist-mal-sync/pkgs/container/anilist-mal-sync)
 

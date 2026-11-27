@@ -1,5 +1,5 @@
 """
-Web UI for AniList-MAL Sync
+Web UI for AniList–MAL Sync
 Provides a simple dashboard for monitoring and controlling the sync service.
 """
 
@@ -44,7 +44,7 @@ def _check_dashboard_access(
 
 
 app = FastAPI(
-    title="AniList-MAL Sync", version="0.1.0",
+    title="AniList–MAL Sync", version="0.1.0",
     dependencies=[Depends(_check_dashboard_access)],
 )
 
@@ -115,7 +115,7 @@ async def dashboard():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AniList-MAL Sync Dashboard</title>
+    <title>AniList–MAL Sync Dashboard</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         html, body {
@@ -278,7 +278,7 @@ async def dashboard():
 <body>
     <div class="container">
         <div class="header">
-            <h1>🔄 AniList-MAL Sync</h1>
+            <h1>🔄 AniList–MAL Sync</h1>
             <p>Monitor and control your anime list synchronization</p>
         </div>
 
@@ -333,7 +333,7 @@ async def dashboard():
         </div>
 
         <div class="footer">
-            <p>AniList-MAL Sync v0.1.0 | Made with ❤️</p>
+            <p>AniList–MAL Sync v0.1.0 | Made with ❤️</p>
             <p style="margin-top: 10px;">
                 <a href="https://ko-fi.com/tareku" target="_blank" rel="noopener noreferrer" style="color: white; text-decoration: none; opacity: 0.9; transition: opacity 0.2s;">
                     ☕ Support the project on <strong>Ko-fi</strong>
