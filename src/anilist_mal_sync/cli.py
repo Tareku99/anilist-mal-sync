@@ -363,6 +363,8 @@ def run(mode: str | None, dry_run: bool, interval: int | None, log_level: str, o
                 try:
                     run_mode = mode or settings.sync_mode
                     success, result = execute_sync(run_mode, dry_run=dry_run or settings.dry_run, settings=settings)
+                    if result is not None and result.accounts:
+                        update_sync_status(accounts=result.accounts)
                     if success and result:
                         if result.dry_run:
                             print_sync_results(result, run_mode)
@@ -377,13 +379,13 @@ def run(mode: str | None, dry_run: bool, interval: int | None, log_level: str, o
                             )
                         else:
                             total = result.entries_synced + result.entries_failed
-                            conflicts = len(result.skipped_conflicts)
+                            skips = f"{len(result.skipped_conflicts)} conflicts, {result.entries_skipped} other skips"
                             if result.success:
                                 logger.info(f"Sync run #{run_count} completed: {result.entries_synced}/{total} synced, 0 failed")
                                 update_sync_status(
                                     running=True,
                                     last_sync=time.strftime('%Y-%m-%d %H:%M:%S %Z'),
-                                    last_result=f"{result.entries_synced}/{total} synced, 0 failed, {conflicts} conflicts",
+                                    last_result=f"{result.entries_synced}/{total} synced, 0 failed, {skips}",
                                     successful=True,
                                 )
                             elif result.entries_synced > 0:
@@ -391,14 +393,14 @@ def run(mode: str | None, dry_run: bool, interval: int | None, log_level: str, o
                                 update_sync_status(
                                     running=True,
                                     last_sync=time.strftime('%Y-%m-%d %H:%M:%S %Z'),
-                                    last_result=f"{result.entries_synced}/{total} synced, {result.entries_failed} failed, {conflicts} conflicts"
+                                    last_result=f"{result.entries_synced}/{total} synced, {result.entries_failed} failed, {skips}"
                                 )
                             else:
                                 logger.error(f"Sync run #{run_count} failed: 0/{total} synced, {result.entries_failed} failed")
                                 update_sync_status(
                                     running=True,
                                     last_sync=time.strftime('%Y-%m-%d %H:%M:%S %Z'),
-                                    last_result=f"0/{total} synced, {result.entries_failed} failed, {conflicts} conflicts"
+                                    last_result=f"0/{total} synced, {result.entries_failed} failed, {skips}"
                                 )
                     else:
                         if result is not None:

@@ -1,6 +1,7 @@
 """MyAnimeList API client."""
 
 import logging
+from urllib.parse import urlsplit
 
 from .base_client import AuthenticationError, BaseAPIClient
 from .config import Settings, get_settings
@@ -39,6 +40,7 @@ class MALClient(BaseAPIClient):
         if expected and expected.casefold() != account.casefold():
             raise ValueError(f"MyAnimeList token belongs to {account}, expected {expected}")
         self.account_key = str(identity.get("id") or account.casefold())
+        self.account_name = account
         logger.info("Syncing MyAnimeList account %s", account)
         entries = []
         url = f"{self.base_url}/users/@me/animelist"
@@ -46,18 +48,34 @@ class MALClient(BaseAPIClient):
             "fields": "list_status{status,score,num_episodes_watched,is_rewatching,updated_at,comments,num_times_rewatched},num_episodes",
             "limit": 1000,
         }
+        visited_urls = set()
+        origin = urlsplit(self.base_url)
 
         while url:
+            location = urlsplit(url)
+            if (location.scheme, location.netloc) != (origin.scheme, origin.netloc):
+                raise ValueError("MyAnimeList returned a page URL outside its API")
+            if url in visited_urls:
+                raise ValueError("MyAnimeList returned the same page URL twice")
+            visited_urls.add(url)
             response = self.session.get(url, params=params, timeout=(5, 30))
             self._handle_auth_error(response, "MyAnimeList")
             response.raise_for_status()
             data = response.json()
 
-            for item in data.get("data", []):
+            if (
+                not isinstance(data, dict)
+                or not isinstance(data.get("data"), list)
+                or not isinstance(data.get("paging"), dict)
+            ):
+                raise ValueError("MyAnimeList returned an incomplete anime list page")
+            for item in data["data"]:
                 entries.append(self._parse_entry(item))
 
             # Pagination
-            url = data.get("paging", {}).get("next")
+            url = data["paging"].get("next")
+            if url is not None and (not isinstance(url, str) or not url):
+                raise ValueError("MyAnimeList returned an invalid next page URL")
             params = {}  # Next URL already contains params
 
         logger.info(f"Fetched {len(entries)} anime entries from MyAnimeList")

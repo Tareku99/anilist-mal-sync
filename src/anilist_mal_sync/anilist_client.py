@@ -71,6 +71,7 @@ class AniListClient(BaseAPIClient):
         if username and username.casefold() != account.casefold():
             raise ValueError(f"AniList token belongs to {account}, expected {username}")
         self.account_key = str(viewer.get("id") or account.casefold())
+        self.account_name = account
         username = account
         logger.info("Syncing AniList account %s", username)
 
@@ -109,10 +110,16 @@ class AniListClient(BaseAPIClient):
         while True:
             data = self._query(query, {"userName": username, "chunk": chunk})
             collection = data.get("MediaListCollection")
-            if collection is None:
-                raise ValueError(f"AniList did not return an anime list for {username}")
-            for list_group in collection.get("lists") or []:
-                for entry in list_group.get("entries") or []:
+            if (
+                not isinstance(collection, dict)
+                or not isinstance(collection.get("lists"), list)
+                or not isinstance(collection.get("hasNextChunk"), bool)
+            ):
+                raise ValueError(f"AniList returned an incomplete anime list chunk ({chunk})")
+            for list_group in collection["lists"]:
+                if not isinstance(list_group, dict) or not isinstance(list_group.get("entries"), list):
+                    raise ValueError(f"AniList returned an incomplete list group in chunk {chunk}")
+                for entry in list_group["entries"]:
                     entry_id = entry["id"]
                     if entry_id not in seen_entry_ids:
                         entries.append(self._parse_entry(entry))

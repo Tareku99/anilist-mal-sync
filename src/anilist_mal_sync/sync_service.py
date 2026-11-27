@@ -394,6 +394,7 @@ def print_sync_results(result, mode: str):
     click.echo(f"Conflicts skipped: {len(result.skipped_conflicts)}")
     for conflict in result.skipped_conflicts[:10]:
         click.echo(f"  - {conflict.title}: {conflict.reason}")
+    click.echo(f"Other entries skipped: {result.entries_skipped}")
     
     if result.errors:
         click.echo(f"\nErrors ({len(result.errors)}):")

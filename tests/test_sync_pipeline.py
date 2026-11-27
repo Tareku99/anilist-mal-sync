@@ -757,3 +757,34 @@ def test_bidirectional_history_merges_independent_fields_and_suppresses_readditi
     result = sync()
     assert result.additions == []
     assert "disappeared" in result.skipped_conflicts[0].reason
+
+
+def test_mal_incomplete_second_page_aborts_before_list_is_used(tmp_path, monkeypatch):
+    config = settings(tmp_path)
+    config.mal_username = ""
+    client = MALClient("token", settings=config)
+    pages = iter([
+        {"name": "tester"},
+        {"data": [], "paging": {"next": client.base_url + "/users/@me/animelist?offset=1000"}},
+        {"paging": {}},
+    ])
+
+    def get(url, **kwargs):
+        payload = next(pages)
+        return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: payload)
+
+    monkeypatch.setattr(client.session, "get", get)
+    with pytest.raises(ValueError, match="incomplete anime list page"):
+        client.get_user_anime_list()
+
+
+def test_anilist_missing_page_metadata_aborts_before_list_is_used(tmp_path, monkeypatch):
+    client = AniListClient("token", settings=settings(tmp_path))
+    pages = iter([
+        {"Viewer": {"id": 1, "name": "tester"}},
+        {"MediaListCollection": {"lists": [], "hasNextChunk": True}},
+        {"MediaListCollection": {"lists": []}},
+    ])
+    monkeypatch.setattr(client, "_query", lambda *args: next(pages))
+    with pytest.raises(ValueError, match="incomplete anime list chunk"):
+        client.get_user_anime_list()

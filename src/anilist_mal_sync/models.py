@@ -67,6 +67,7 @@ class SyncResult(BaseModel):
     entries_failed: int = 0
     errors: list[str] = Field(default_factory=list)
     dry_run: bool = False
+    accounts: dict[str, str] = Field(default_factory=dict)
     additions: list[SyncChange] = Field(default_factory=list)
     updates: list[SyncChange] = Field(default_factory=list)
     skipped_conflicts: list[SyncChange] = Field(default_factory=list)
@@ -76,3 +77,8 @@ class SyncResult(BaseModel):
     def planned_changes(self) -> int:
         """Number of additions and updates in the sync plan."""
         return len(self.additions) + len(self.updates)
+
+    @property
+    def entries_skipped(self) -> int:
+        """Count entries left alone for a reason other than already being in sync."""
+        return sum(change.reason != "already in sync" for change in self.skipped)

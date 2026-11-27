@@ -224,6 +224,8 @@ Both lists are read from the accounts that own the access tokens. If you configu
 
 When adding a MAL entry to AniList, sync looks up its MAL ID directly. A single verified match can be added automatically. Duplicate IDs and same-title suggestions without a verified match are reported for review.
 
+If either service returns an incomplete list page or chunk, the run stops before planning or writing any changes. Individual titles without a safe match are skipped, and the rest of a run can continue.
+
 Sync runs use an OS-backed lock in the configured token directory, preventing separate local processes that share that directory from syncing at the same time. AniList and MAL do not provide conditional list writes here, so an external edit made after the lists are fetched can still race with a pending update.
 
 ## How It Works

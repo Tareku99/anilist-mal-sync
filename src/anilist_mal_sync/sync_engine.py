@@ -184,6 +184,8 @@ class SyncEngine:
         operation = "skipped_conflict" if conflict else "skipped"
         if conflict:
             logger.warning("Skipping %s: %s", self._safe_title(entry.title), reason)
+        elif reason != "already in sync":
+            logger.info("Skipping %s: %s", self._safe_title(entry.title), reason)
         self._record(
             result,
             self._make_change(
@@ -299,6 +301,7 @@ class SyncEngine:
             target_entries = self.anilist.get_user_anime_list(username)
             target_client = self.anilist
 
+        result.accounts = self._verified_accounts()
         source_groups = self._group_by_mal_id(source_entries)
         target_groups = self._group_by_mal_id(target_entries)
         by_anilist_id: dict[int, list[AnimeEntry]] = defaultdict(list)
@@ -447,6 +450,7 @@ class SyncEngine:
         username = self.settings.anilist_username or None
         anilist_entries = self.anilist.get_user_anime_list(username)
         mal_entries = self.mal.get_user_anime_list()
+        result.accounts = self._verified_accounts()
         history = self._load_history()
         anilist_groups = self._group_by_mal_id(anilist_entries)
         mal_groups = self._group_by_mal_id(mal_entries)
@@ -531,6 +535,14 @@ class SyncEngine:
             history.save()
         result.success = result.entries_failed == 0
         return result
+
+    def _verified_accounts(self) -> dict[str, str]:
+        accounts = {}
+        for name, client in (("anilist", self.anilist), ("mal", self.mal)):
+            username = getattr(client, "account_name", None)
+            if isinstance(username, str):
+                accounts[name] = username
+        return accounts
 
     def _load_history(self) -> SyncHistory | None:
         if self.history_directory is None:

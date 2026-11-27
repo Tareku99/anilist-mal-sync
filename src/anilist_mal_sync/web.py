@@ -16,7 +16,7 @@ import yaml
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from .config import Config, get_settings, reload_settings
 from .models import SyncResult
@@ -73,6 +73,7 @@ sync_status = {
     "total_syncs": 0,
     "preview": None,
     "last_manual_success": None,
+    "accounts": {},
 }
 
 # Threading lock to prevent concurrent syncs
@@ -101,6 +102,7 @@ class SyncStatus(BaseModel):
     sync_in_progress: bool = False  # True if any sync (scheduled or manual) is running
     preview_only: bool = False
     last_manual_success: bool | None = None
+    accounts: dict[str, str] = Field(default_factory=dict)
     preview: SyncResult | None = None
 
 
@@ -286,6 +288,10 @@ async def dashboard():
                     <span class="status-value" id="status-running">Loading...</span>
                 </div>
                 <div class="status-item">
+                    <span class="status-label">Last Verified Accounts:</span>
+                    <span class="status-value" id="status-accounts">—</span>
+                </div>
+                <div class="status-item">
                     <span class="status-label">Last Attempt:</span>
                     <span class="status-value" id="status-last-sync">-</span>
                 </div>
@@ -380,6 +386,10 @@ async def dashboard():
 
         function renderStatus(data) {
             byId('status-running').textContent = data.running ? 'Running' : 'Inactive';
+            const accounts = data.accounts || {};
+            byId('status-accounts').textContent = accounts.anilist && accounts.mal
+                ? 'AniList: ' + accounts.anilist + ' · MAL: ' + accounts.mal
+                : '—';
             byId('status-running').className = 'status-value ' + (data.running ? 'status-running' : 'status-stopped');
             byId('status-last-sync').textContent = data.last_sync || '—';
             byId('status-last-success').textContent = data.last_successful_sync || '—';
@@ -623,6 +633,8 @@ async def trigger_sync(preview: bool = False):
             try:
                 logger.info(f"[INFO] Manual sync started (mode: {mode})")
                 success, result = execute_sync(mode, dry_run=dry_run, settings=settings)
+                if result is not None and result.accounts:
+                    update_sync_status(accounts=result.accounts)
                 sync_status["last_manual_success"] = bool(success and result and result.success)
                 if dry_run:
                     sync_status["preview"] = result
@@ -631,7 +643,7 @@ async def trigger_sync(preview: bool = False):
                     if result.dry_run:
                         result_msg = (
                             f"Dry run: {result.planned_changes} planned, "
-                            f"{len(result.skipped_conflicts)} conflicts (Manual)"
+                            f"{len(result.skipped_conflicts)} conflicts, {result.entries_skipped} other skips (Manual)"
                         )
                         logger.info("[INFO] Manual sync completed: %s", result_msg)
                     else:
@@ -645,7 +657,10 @@ async def trigger_sync(preview: bool = False):
                         else:
                             result_msg = f"0/{total} synced, {result.entries_failed} failed"
                             logger.error(f"[ERROR] Manual sync failed: {result_msg}")
-                        result_msg += f", {len(result.skipped_conflicts)} conflicts (Manual)"
+                        result_msg += (
+                            f", {len(result.skipped_conflicts)} conflicts, "
+                            f"{result.entries_skipped} other skips (Manual)"
+                        )
                     
                     update_sync_status(
                         last_sync=time.strftime('%Y-%m-%d %H:%M:%S %Z'),
@@ -688,10 +703,13 @@ def update_sync_status(
     running: bool | None = None, last_sync: str | None = None,
     next_sync: str | None = None, last_result: str | None = None,
     successful: bool = False,
+    accounts: dict[str, str] | None = None,
 ):
     """Update the global sync status (called from CLI)"""
     if running is not None:
         sync_status["running"] = running
+    if accounts is not None:
+        sync_status["accounts"] = accounts
     if last_sync:
         sync_status["last_sync"] = last_sync
         if successful:
