@@ -380,6 +380,9 @@ def print_sync_results(result, mode: str):
     click.echo(f"Success: {result.success}")
     click.echo(f"Entries synced: {result.entries_synced}")
     click.echo(f"Entries failed: {result.entries_failed}")
+    click.echo(f"Conflicts skipped: {len(result.skipped_conflicts)}")
+    for conflict in result.skipped_conflicts[:10]:
+        click.echo(f"  - {conflict.title}: {conflict.reason}")
     
     if result.errors:
         click.echo(f"\nErrors ({len(result.errors)}):")

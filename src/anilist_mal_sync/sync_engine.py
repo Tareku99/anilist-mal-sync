@@ -38,10 +38,10 @@ class SyncEngine:
         return (title or "").encode("ascii", "replace").decode("ascii")
 
     @staticmethod
-    def _normalize_score_for_mal(score: float | None) -> int | None:
+    def _normalize_score_for_mal(score: float | None) -> int:
         """Normalize AniList's 0-100 and MAL's 0-10 scales for comparison."""
         if score is None:
-            return None
+            return 0
         if score > 10:
             score /= 10.0
         return int(round(score))
@@ -74,7 +74,7 @@ class SyncEngine:
         cls, entries: list[AnimeEntry]
     ) -> dict[int, list[AnimeEntry]]:
         grouped: dict[int, list[AnimeEntry]] = defaultdict(list)
-        for entry in entries:
+        for entry in cls._ordered_entries(entries):
             if entry.mal_id is not None:
                 grouped[entry.mal_id].append(entry)
         return dict(grouped)
@@ -175,6 +175,8 @@ class SyncEngine:
         winner: str | None = None,
     ) -> None:
         operation = "skipped_conflict" if conflict else "skipped"
+        if conflict:
+            logger.warning("Skipping %s: %s", self._safe_title(entry.title), reason)
         self._record(
             result,
             self._make_change(
@@ -280,6 +282,7 @@ class SyncEngine:
         for entry in target_entries:
             if entry.anilist_id is not None:
                 by_anilist_id[entry.anilist_id].append(entry)
+        reserved_anilist_ids = set(by_anilist_id)
 
         for source_entry in self._ordered_entries(source_entries):
             mal_id = source_entry.mal_id
@@ -351,6 +354,10 @@ class SyncEngine:
                             conflict=ambiguous,
                         )
                         continue
+                    if not self._reserve_anilist_match(
+                        result, source_entry, anilist_id, reserved_anilist_ids
+                    ):
+                        continue
                     prepared_entry = source_entry.model_copy(update={"anilist_id": anilist_id})
 
             self._apply(
@@ -399,6 +406,21 @@ class SyncEngine:
             return None, "multiple exact AniList title matches", True
         return None, "no exact AniList title match", False
 
+    def _reserve_anilist_match(
+        self, result: SyncResult, entry: AnimeEntry, anilist_id: int, reserved_ids: set[int]
+    ) -> bool:
+        """Protect existing entries and earlier matches from a search-based addition."""
+        if anilist_id in reserved_ids:
+            self._skip(
+                result,
+                entry.model_copy(update={"anilist_id": anilist_id}),
+                f"AniList ID {anilist_id} already exists on the list or was matched in this run",
+                conflict=True,
+            )
+            return False
+        reserved_ids.add(anilist_id)
+        return True
+
     def _sync_bidirectional(self) -> SyncResult:
         """Sync both ways using conservative, deterministic conflict rules."""
         result = SyncResult(success=True, dry_run=self.dry_run)
@@ -407,6 +429,9 @@ class SyncEngine:
         mal_entries = self.mal.get_user_anime_list()
         anilist_groups = self._group_by_mal_id(anilist_entries)
         mal_groups = self._group_by_mal_id(mal_entries)
+        reserved_anilist_ids = {
+            entry.anilist_id for entry in anilist_entries if entry.anilist_id is not None
+        }
 
         for entry in self._ordered_entries(anilist_entries):
             if entry.mal_id is None:
@@ -453,6 +478,10 @@ class SyncEngine:
                     continue
                 if anilist_id is None:
                     self._skip(result, mal_entry, reason, conflict=ambiguous)
+                    continue
+                if not self._reserve_anilist_match(
+                    result, mal_entry, anilist_id, reserved_anilist_ids
+                ):
                     continue
                 prepared_entry = mal_entry.model_copy(update={"anilist_id": anilist_id})
                 self._apply(
@@ -556,13 +585,11 @@ class SyncEngine:
             if anilist_time is not None and mal_time is not None
             else "different values cannot be ordered because an update timestamp is missing"
         )
-        self._record(
+        self._skip(
             result,
-            self._make_change(
-                "skipped_conflict",
-                anilist_entry,
-                fields=fields,
-                differences=self._conflict_differences(anilist_entry, mal_entry, fields),
-                reason=reason,
-            ),
+            anilist_entry,
+            reason,
+            conflict=True,
+            fields=fields,
+            differences=self._conflict_differences(anilist_entry, mal_entry, fields),
         )

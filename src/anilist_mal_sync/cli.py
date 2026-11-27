@@ -153,8 +153,7 @@ def auth(service: str):
 @click.option(
     "--mode",
     type=click.Choice(["anilist-to-mal", "mal-to-anilist", "bidirectional"]),
-    default="bidirectional",
-    help="Sync mode: one-way or bidirectional",
+    help="Override the configured sync mode",
 )
 @click.option(
     "--dry-run",
@@ -195,7 +194,7 @@ def auth(service: str):
     default="0.0.0.0",
     help="Web UI host",
 )
-def run(mode: str, dry_run: bool, interval: int | None, log_level: str, once: bool, no_web_ui: bool, port: int, host: str):
+def run(mode: str | None, dry_run: bool, interval: int | None, log_level: str, once: bool, no_web_ui: bool, port: int, host: str):
     """
     Run sync service (default: continuous sync with web UI).
     
@@ -212,15 +211,16 @@ def run(mode: str, dry_run: bool, interval: int | None, log_level: str, once: bo
     # --once: Run sync once and exit (like old sync command)
     if once:
         try:
-            success, result = execute_sync(mode, dry_run=dry_run or settings.dry_run)
+            run_mode = mode or settings.sync_mode
+            success, result = execute_sync(run_mode, dry_run=dry_run or settings.dry_run, settings=settings)
             
             if not success or result is None:
                 if result is not None:
-                    print_sync_results(result, mode)
+                    print_sync_results(result, run_mode)
                 logger.error("Sync failed")
                 sys.exit(1)
             
-            print_sync_results(result, mode)
+            print_sync_results(result, run_mode)
             sys.exit(0 if result.success else 1)
             
         except Exception as e:
@@ -236,7 +236,7 @@ def run(mode: str, dry_run: bool, interval: int | None, log_level: str, once: bo
     
     logger.info("="*60)
     logger.info("Starting AniList-MAL Sync Service")
-    logger.info(f"Mode: {mode}")
+    logger.info(f"Mode: {mode or settings.sync_mode}")
     logger.info(f"Interval: {interval} minutes ({interval//60}h {interval%60}m)")
     if not no_web_ui:
         # Determine Web UI URL
@@ -283,7 +283,7 @@ def run(mode: str, dry_run: bool, interval: int | None, log_level: str, once: bo
         from .web import app, update_sync_status, set_cli_sync_params, is_sync_running, acquire_sync_lock
         
         # Store CLI sync parameters for manual sync button
-        set_cli_sync_params(mode, dry_run or settings.dry_run)
+        set_cli_sync_params(mode, dry_run)
         
         # Start sync service in background thread
         def sync_service():
@@ -361,10 +361,11 @@ def run(mode: str, dry_run: bool, interval: int | None, log_level: str, once: bo
                 logger.info(f"Starting sync run #{run_count}...")
                 
                 try:
-                    success, result = execute_sync(mode, dry_run=dry_run or settings.dry_run, settings=settings)
+                    run_mode = mode or settings.sync_mode
+                    success, result = execute_sync(run_mode, dry_run=dry_run or settings.dry_run, settings=settings)
                     if success and result:
                         if result.dry_run:
-                            print_sync_results(result, mode)
+                            print_sync_results(result, run_mode)
                             last_result = (
                                 f"Dry run: {result.planned_changes} planned, "
                                 f"{len(result.skipped_conflicts)} conflicts"
@@ -376,30 +377,31 @@ def run(mode: str, dry_run: bool, interval: int | None, log_level: str, once: bo
                             )
                         else:
                             total = result.entries_synced + result.entries_failed
+                            conflicts = len(result.skipped_conflicts)
                             if result.success:
                                 logger.info(f"Sync run #{run_count} completed: {result.entries_synced}/{total} synced, 0 failed")
                                 update_sync_status(
                                     running=True,
                                     last_sync=time.strftime('%Y-%m-%d %H:%M:%S %Z'),
-                                    last_result=f"{result.entries_synced}/{total} synced, 0 failed"
+                                    last_result=f"{result.entries_synced}/{total} synced, 0 failed, {conflicts} conflicts"
                                 )
                             elif result.entries_synced > 0:
                                 logger.warning(f"Sync run #{run_count} completed: {result.entries_synced}/{total} synced, {result.entries_failed} failed")
                                 update_sync_status(
                                     running=True,
                                     last_sync=time.strftime('%Y-%m-%d %H:%M:%S %Z'),
-                                    last_result=f"{result.entries_synced}/{total} synced, {result.entries_failed} failed"
+                                    last_result=f"{result.entries_synced}/{total} synced, {result.entries_failed} failed, {conflicts} conflicts"
                                 )
                             else:
                                 logger.error(f"Sync run #{run_count} failed: 0/{total} synced, {result.entries_failed} failed")
                                 update_sync_status(
                                     running=True,
                                     last_sync=time.strftime('%Y-%m-%d %H:%M:%S %Z'),
-                                    last_result=f"0/{total} synced, {result.entries_failed} failed"
+                                    last_result=f"0/{total} synced, {result.entries_failed} failed, {conflicts} conflicts"
                                 )
                     else:
                         if result is not None:
-                            print_sync_results(result, mode)
+                            print_sync_results(result, run_mode)
                             update_sync_status(
                                 running=True,
                                 last_sync=time.strftime('%Y-%m-%d %H:%M:%S %Z'),
@@ -526,10 +528,11 @@ def run(mode: str, dry_run: bool, interval: int | None, log_level: str, once: bo
             logger.info(f"Starting sync run #{run_count}...")
             
             try:
-                success, result = execute_sync(mode, dry_run=dry_run or settings.dry_run, settings=settings)
+                run_mode = mode or settings.sync_mode
+                success, result = execute_sync(run_mode, dry_run=dry_run or settings.dry_run, settings=settings)
                 if success and result:
                     if result.dry_run:
-                        print_sync_results(result, mode)
+                        print_sync_results(result, run_mode)
                         logger.info(
                             "Dry-run plan: %s changes, %s conflicts",
                             result.planned_changes,
@@ -545,7 +548,7 @@ def run(mode: str, dry_run: bool, interval: int | None, log_level: str, once: bo
                             logger.error(f"Sync run #{run_count} failed: 0/{total} synced, {result.entries_failed} failed")
                 else:
                     if result is not None:
-                        print_sync_results(result, mode)
+                        print_sync_results(result, run_mode)
                         logger.error(
                             "Sync run #%s failed after %s writes and %s errors",
                             run_count,

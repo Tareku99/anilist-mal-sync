@@ -494,7 +494,7 @@ async def trigger_sync():
     try:
         settings = get_settings()
         mode = _cli_sync_mode if _cli_sync_mode else settings.sync_mode
-        dry_run = _cli_dry_run if _cli_dry_run is not None else settings.dry_run
+        dry_run = bool(_cli_dry_run) or settings.dry_run
         
         def run_manual_sync():
             try:
@@ -513,14 +513,15 @@ async def trigger_sync():
                     else:
                         total = result.entries_synced + result.entries_failed
                         if result.success:
-                            result_msg = f"{result.entries_synced}/{total} synced, 0 failed (Manual)"
+                            result_msg = f"{result.entries_synced}/{total} synced, 0 failed"
                             logger.info(f"[INFO] Manual sync completed: {result_msg}")
                         elif result.entries_synced > 0:
-                            result_msg = f"{result.entries_synced}/{total} synced, {result.entries_failed} failed (Manual)"
+                            result_msg = f"{result.entries_synced}/{total} synced, {result.entries_failed} failed"
                             logger.warning(f"[WARNING] Manual sync completed: {result_msg}")
                         else:
-                            result_msg = f"0/{total} synced, {result.entries_failed} failed (Manual)"
+                            result_msg = f"0/{total} synced, {result.entries_failed} failed"
                             logger.error(f"[ERROR] Manual sync failed: {result_msg}")
+                        result_msg += f", {len(result.skipped_conflicts)} conflicts (Manual)"
                     
                     update_sync_status(
                         last_sync=time.strftime('%Y-%m-%d %H:%M:%S %Z'),
@@ -572,7 +573,7 @@ def update_sync_status(running: bool = None, last_sync: str = None,
         sync_status["total_syncs"] += 1
 
 
-def set_cli_sync_params(mode: str, dry_run: bool):
+def set_cli_sync_params(mode: str | None, dry_run: bool):
     """Set the sync mode and dry_run from CLI (called when web UI starts)"""
     global _cli_sync_mode, _cli_dry_run
     _cli_sync_mode = mode

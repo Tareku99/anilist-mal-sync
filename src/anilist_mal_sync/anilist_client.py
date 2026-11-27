@@ -64,9 +64,16 @@ class AniListClient(BaseAPIClient):
 
     def get_user_anime_list(self, username: Optional[str] = None) -> list[AnimeEntry]:
         """Fetch user's anime list from AniList."""
+        if not username:
+            viewer = self._query("query { Viewer { name } }").get("Viewer")
+            username = viewer.get("name") if viewer else None
+            if not username:
+                raise ValueError("AniList did not return the authenticated user's name")
+
         query = """
-        query ($userName: String) {
-          MediaListCollection(userName: $userName, type: ANIME) {
+        query ($userName: String!, $chunk: Int!) {
+          MediaListCollection(userName: $userName, type: ANIME, chunk: $chunk) {
+            hasNextChunk
             lists {
               entries {
                 id
@@ -92,15 +99,23 @@ class AniListClient(BaseAPIClient):
         }
         """
 
-        # If no username provided, get current authenticated user
-        variables = {"userName": username} if username else None
-
-        data = self._query(query, variables)
         entries = []
-
-        for list_group in data.get("MediaListCollection", {}).get("lists", []):
-            for entry in list_group.get("entries", []):
-                entries.append(self._parse_entry(entry))
+        seen_entry_ids = set()
+        chunk = 1
+        while True:
+            data = self._query(query, {"userName": username, "chunk": chunk})
+            collection = data.get("MediaListCollection")
+            if collection is None:
+                raise ValueError(f"AniList did not return an anime list for {username}")
+            for list_group in collection.get("lists") or []:
+                for entry in list_group.get("entries") or []:
+                    entry_id = entry["id"]
+                    if entry_id not in seen_entry_ids:
+                        entries.append(self._parse_entry(entry))
+                        seen_entry_ids.add(entry_id)
+            if not collection.get("hasNextChunk"):
+                break
+            chunk += 1
 
         logger.info(f"Fetched {len(entries)} anime entries from AniList")
         return entries
@@ -178,7 +193,7 @@ class AniListClient(BaseAPIClient):
             "status": status_map.get(entry.status),
             "progress": entry.episodes_watched,
             "repeat": entry.rewatched,
-            "notes": entry.notes,
+            "notes": entry.notes or "",
         }
         score_argument = ""
         score_variable = ""

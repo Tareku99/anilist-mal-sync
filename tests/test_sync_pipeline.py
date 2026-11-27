@@ -648,7 +648,7 @@ def test_dry_run_serialization_is_deterministic(monkeypatch):
 
 
 def test_cli_dry_run_flag_requests_plan_and_prints_json(monkeypatch):
-    config = SimpleNamespace(dry_run=False, log_level="INFO")
+    config = SimpleNamespace(dry_run=False, log_level="INFO", sync_mode="bidirectional")
     calls = {}
     monkeypatch.setattr(cli, "get_settings", lambda: config)
     monkeypatch.setattr(cli, "setup_logging", lambda level: None)
