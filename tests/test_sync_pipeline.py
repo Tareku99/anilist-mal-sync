@@ -710,7 +710,7 @@ def test_active_rewatch_is_reported_without_writes(tmp_path, source, mode):
     result = SyncEngine(anilist, mal, settings=settings(tmp_path)).sync(mode)
 
     assert result.entries_synced == 0
-    assert result.skipped_conflicts[0].reason == "active rewatch requires review"
+    assert result.skipped_conflicts[0].reason == "active rewatch has an unsupported base status"
     assert anilist.updates == mal.updates == []
 
 
@@ -942,3 +942,54 @@ def test_real_clients_round_trip_supported_fields_and_settle(tmp_path, monkeypat
     }
     assert engine.sync("bidirectional").planned_changes == 0
     assert writes == ["mal", "anilist"]
+
+
+def test_bidirectional_rewatch_start_uses_status_progress_and_count(tmp_path):
+    completed = WatchStatus.COMPLETED
+    anilist = FakeClient([entry(7, anilist_id=70, status=completed, episodes=5)])
+    mal = FakeClient([entry(7, status=completed, episodes=5)])
+    anilist.account_key, mal.account_key = "11", "22"
+    engine = SyncEngine(anilist, mal, settings=settings(tmp_path), history_directory=tmp_path)
+    assert engine.sync("bidirectional").planned_changes == 0
+
+    anilist.entries[0].is_rewatching = True
+    anilist.entries[0].episodes_watched = 1
+    result = engine.sync("bidirectional")
+    assert result.entries_synced == 1
+    assert result.updates[0].fields == ["status", "is_rewatching", "episodes_watched", "rewatched"]
+    assert mal.updates[0].is_rewatching
+
+
+def test_rewatch_transition_conflicts_with_other_side_progress_edit(tmp_path):
+    completed = WatchStatus.COMPLETED
+    anilist = FakeClient([entry(7, anilist_id=70, status=completed, episodes=5)])
+    mal = FakeClient([entry(7, status=completed, episodes=5)])
+    anilist.account_key, mal.account_key = "11", "22"
+    engine = SyncEngine(anilist, mal, settings=settings(tmp_path), history_directory=tmp_path)
+    assert engine.sync("bidirectional").planned_changes == 0
+
+    anilist.entries[0].is_rewatching = True
+    anilist.entries[0].episodes_watched = 1
+    mal.entries[0].episodes_watched = 4
+    result = engine.sync("bidirectional")
+    assert result.planned_changes == 0
+    assert result.skipped_conflicts[0].fields == ["is_rewatching", "episodes_watched"]
+    assert not anilist.updates and not mal.updates
+
+
+def test_mal_finish_without_increased_count_is_not_written_to_anilist(tmp_path):
+    completed = WatchStatus.COMPLETED
+    al_entry = entry(7, anilist_id=70, status=completed, episodes=2)
+    al_entry.is_rewatching = True
+    anilist = FakeClient([al_entry])
+    mal = FakeClient([entry(7, status=completed, episodes=5)])
+    engine = SyncEngine(anilist, mal, settings=settings(tmp_path))
+    result = engine.sync("mal-to-anilist")
+    assert not anilist.updates
+    assert "without an increased count" in result.skipped_conflicts[0].reason
+
+    mal.entries[0].rewatched = 1
+    result = engine.sync("mal-to-anilist")
+    assert result.entries_synced == 1
+    assert result.updates[0].fields == ["status", "is_rewatching", "episodes_watched", "rewatched"]
+    assert anilist.updates[0].rewatched == 1

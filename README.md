@@ -228,7 +228,7 @@ For a one-time check of a specific title, use `run --once --dry-run --mal-id 123
 
 Bidirectional sync records agreed values for each pair of accounts in the token directory. A field changed on one side since the last agreement can sync independently of other fields. Conflicting changes and first-run disagreements are reported for review. If an entry previously seen on both lists disappears from one list, sync reports it and skips re-adding it. Dry runs leave this history untouched.
 
-Both lists are read from the accounts that own the access tokens. If you configure usernames, they must match those accounts. Active rewatches and unrecognized statuses are reported as conflicts pending verification of rewatch progress and status conversion.
+Both lists are read from the accounts that own the access tokens. If you configure usernames, they must match those accounts. AniList `REPEATING` maps to MAL `completed` with the active rewatch flag set. Progress and the completed rewatch count sync separately from that flag. Ambiguous transitions are skipped, including a MAL rewatch ending without an increased count when AniList would otherwise increment it.
 
 When adding a MAL entry to AniList, sync looks up its MAL ID directly. A single verified match can be added automatically. Duplicate IDs and same-title suggestions without a verified match are reported for review.
 

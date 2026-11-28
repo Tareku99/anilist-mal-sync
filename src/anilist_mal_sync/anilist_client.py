@@ -217,7 +217,10 @@ class AniListClient(BaseAPIClient):
         }
 
         candidates = {
-            "status": ("status", "MediaListStatus", status_map.get(entry.status)),
+            "status": (
+                "status", "MediaListStatus",
+                "REPEATING" if entry.is_rewatching else status_map.get(entry.status),
+            ),
             "episodes_watched": ("progress", "Int", entry.episodes_watched),
             "rewatched": ("repeat", "Int", entry.rewatched),
             "notes": ("notes", "String", entry.notes or ""),
@@ -233,6 +236,8 @@ class AniListClient(BaseAPIClient):
         variables = {"mediaId": entry.anilist_id}
         declarations = ["$mediaId: Int"]
         arguments = ["mediaId: $mediaId"]
+        if fields is not None and "is_rewatching" in fields and "status" not in fields:
+            fields = [*fields, "status"]
         for field, (name, graphql_type, value) in candidates.items():
             if fields is None or field in fields:
                 variables[name] = value

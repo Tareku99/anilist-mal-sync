@@ -144,6 +144,7 @@ class MALClient(BaseAPIClient):
         data = {
             "status": status_map.get(entry.status),
             "num_watched_episodes": entry.episodes_watched,
+            "is_rewatching": "true" if entry.is_rewatching else "false",
         }
 
         # Handle score syncing based on configuration
@@ -160,6 +161,7 @@ class MALClient(BaseAPIClient):
         if fields is not None:
             parameter_names = {
                 "status": "status",
+                "is_rewatching": "is_rewatching",
                 "episodes_watched": "num_watched_episodes",
                 "rewatched": "num_times_rewatched",
                 "notes": "comments",

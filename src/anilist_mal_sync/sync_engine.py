@@ -20,7 +20,8 @@ Platform = Literal["anilist", "mal"]
 class SyncEngine:
     """Plan and apply deterministic changes between AniList and MAL."""
 
-    SYNC_FIELDS = ("status", "episodes_watched", "rewatched", "notes", "score")
+    SYNC_FIELDS = ("status", "is_rewatching", "episodes_watched", "rewatched", "notes", "score")
+    REWATCH_FIELDS = frozenset(("status", "is_rewatching", "episodes_watched", "rewatched"))
 
     def __init__(
         self,
@@ -102,6 +103,8 @@ class SyncEngine:
         changed = []
         if source_entry.status != target_entry.status:
             changed.append("status")
+        if source_entry.is_rewatching != target_entry.is_rewatching:
+            changed.append("is_rewatching")
         if source_entry.episodes_watched != target_entry.episodes_watched:
             changed.append("episodes_watched")
         if source_entry.rewatched != target_entry.rewatched:
@@ -207,8 +210,8 @@ class SyncEngine:
         if any(item.status == WatchStatus.UNKNOWN for item in entries):
             self._skip(result, entry, "unrecognized watch status", conflict=True)
             return True
-        if any(item.is_rewatching for item in entries):
-            self._skip(result, entry, "active rewatch requires review", conflict=True)
+        if any(item.is_rewatching and item.status != WatchStatus.COMPLETED for item in entries):
+            self._skip(result, entry, "active rewatch has an unsupported base status", conflict=True)
             return True
         return False
 
@@ -231,6 +234,26 @@ class SyncEngine:
             )
         if self.settings.score_sync_mode != "auto":
             fields = [field for field in fields if field != "score"]
+        if (
+            target == "anilist" and target_entry is not None
+            and target_entry.is_rewatching and not source_entry.is_rewatching
+            and "is_rewatching" in fields and source_entry.status == WatchStatus.COMPLETED
+            and source_entry.rewatched <= target_entry.rewatched
+        ):
+            self._skip(
+                result, source_entry,
+                "MAL ended a rewatch without an increased count; AniList would increment it",
+                conflict=True, fields=fields,
+                differences=self._conflict_differences(target_entry, source_entry, fields),
+            )
+            return
+        if target_entry is not None and "is_rewatching" in fields:
+            # AniList represents rewatching in its status. Always send the verified
+            # count on a transition so an automatic increment cannot double-count.
+            fields = [
+                field for field in self.SYNC_FIELDS
+                if field in fields or field in ("status", "rewatched")
+            ]
         if target_entry is not None and not fields:
             self._skip(result, source_entry, "already in sync")
             return
@@ -591,6 +614,18 @@ class SyncEngine:
                 to_anilist.append(field)
             else:
                 conflicts.append(field)
+        if anilist.is_rewatching != mal.is_rewatching:
+            changing = self.REWATCH_FIELDS.intersection(al_values)
+            if (
+                changing.intersection(conflicts)
+                or (changing.intersection(to_mal) and changing.intersection(to_anilist))
+            ):
+                conflicts = [
+                    field for field in self.SYNC_FIELDS
+                    if field in conflicts or (field in changing and al_values[field] != mal_values[field])
+                ]
+                to_mal = [field for field in to_mal if field not in changing]
+                to_anilist = [field for field in to_anilist if field not in changing]
         history.remember(mal_id, agreed)
         if conflicts:
             self._skip(
