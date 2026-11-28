@@ -1037,3 +1037,29 @@ def test_bidirectional_private_entry_discards_previously_agreed_notes(tmp_path):
     assert engine.sync("bidirectional").skipped_conflicts[0].reason == "private AniList entry"
     entries = json.loads(history_file.read_text())["entries"]
     assert entries == {"7": {}}
+
+
+def test_disabling_score_sync_omits_ratings_from_both_api_payloads(tmp_path, monkeypatch):
+    config = settings(tmp_path, score_sync_mode="disabled")
+    anilist = AniListClient("fixture-token", config)
+    mal = MALClient("fixture-token", config)
+    anime = entry(7, anilist_id=70, score=8.6)
+
+    def mutate_anilist(document, variables):
+        assert "scoreRaw" not in document
+        assert "scoreRaw" not in variables
+        return {"SaveMediaListEntry": {"id": 1}}
+
+    def patch_mal(url, *, data, **kwargs):
+        assert "score" not in data
+        return SimpleNamespace(status_code=200, raise_for_status=lambda: None)
+
+    monkeypatch.setattr(anilist, "_query", mutate_anilist)
+    monkeypatch.setattr(mal.session, "patch", patch_mal)
+    assert anilist.update_anime(anime)
+    assert mal.update_anime(anime)
+
+    source = FakeClient([anime])
+    target = FakeClient([entry(7, score=4, episodes=0)])
+    plan = SyncEngine(source, target, settings=config, dry_run=True).sync("anilist-to-mal")
+    assert plan.updates[0].fields == ["episodes_watched"]

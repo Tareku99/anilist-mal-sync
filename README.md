@@ -238,6 +238,8 @@ The MAL list reader includes all ratings so titles hidden by MAL's default API f
 
 Private AniList entries are excluded from sync in both directions. If AniList omits an entry's privacy setting, that entry is skipped as well. The app never copies private notes into a preview or new sync history.
 
+With `sync.score_sync_mode: auto`, fractional AniList scores are compared at MAL's whole-number precision. When the scores are equivalent at that precision, an update to another field preserves the finer AniList score. Set `sync.score_sync_mode: disabled` to keep ratings independent, including for newly added titles.
+
 Sync runs use an OS-backed lock in the configured token directory, preventing separate local processes that share that directory from syncing at the same time. AniList and MAL do not provide conditional list writes here, so an external edit made after the lists are fetched can still race with a pending update.
 
 ## How It Works

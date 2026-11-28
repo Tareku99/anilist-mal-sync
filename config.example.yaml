@@ -21,5 +21,6 @@ sync:
   interval: 360          # Sync interval in minutes (360 = 6 hours)
   log_level: "INFO"      # Options: DEBUG, INFO, WARNING, ERROR
   dry_run: false         # If true, shows what would change without making changes
+  score_sync_mode: "auto"  # Use "disabled" to keep each site's ratings independent
 
 # token_file_path: "/app/data/tokens.json"  # Optional, has default
