@@ -491,7 +491,7 @@ def test_anilist_write_uses_raw_100_point_score(monkeypatch):
 
     def capture_mutation(query, variables=None):
         captured.update(query=query, variables=variables)
-        return {}
+        return {"SaveMediaListEntry": {"id": 1}}
 
     monkeypatch.setattr(client, "_query", capture_mutation)
 
@@ -499,6 +499,12 @@ def test_anilist_write_uses_raw_100_point_score(monkeypatch):
     assert captured["variables"]["scoreRaw"] == 85
     assert "scoreRaw: $scoreRaw" in captured["query"]
     assert "score: $score" not in captured["query"]
+
+
+def test_anilist_write_requires_confirmation(monkeypatch, tmp_path):
+    client = AniListClient("fixture-token", settings(tmp_path))
+    monkeypatch.setattr(client, "_query", lambda *args: {"SaveMediaListEntry": None})
+    assert not client.update_anime(entry(7, anilist_id=70), fields=["episodes_watched"])
 
 
 def test_auth_error_during_sync_refreshes_mal_and_restarts_from_fresh_lists(
@@ -864,3 +870,75 @@ def test_watch_status_round_trip(tmp_path, monkeypatch, anilist_status, mal_stat
     monkeypatch.setattr(mal.session, "patch", patch_mal)
     assert anilist.update_anime(mal_entry, fields=["status"])
     assert mal.update_anime(al_entry, fields=["status"])
+
+
+def test_real_clients_round_trip_supported_fields_and_settle(tmp_path, monkeypatch):
+    config = settings(tmp_path)
+    config.mal_username = ""
+    anilist = AniListClient("fixture-token", config)
+    mal = MALClient("fixture-token", config)
+    al_state = {
+        "id": 1, "status": "CURRENT", "progress": 2, "score": 8.6, "notes": "Test Ω",
+        "repeat": 1, "media": {"id": 70, "idMal": 7, "title": {"english": "Test"}},
+    }
+    mal_state = {
+        "status": "plan_to_watch", "num_episodes_watched": 0, "score": 0,
+        "comments": "", "num_times_rewatched": 0, "is_rewatching": False,
+    }
+    writes = []
+
+    def response(payload):
+        return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: payload)
+
+    def graphql(url, *, json, **kwargs):
+        document = json["query"]
+        if "Viewer" in document:
+            return response({"data": {"Viewer": {"id": 11, "name": "test-user"}}})
+        if "MediaListCollection" in document:
+            return response({"data": {"MediaListCollection": {
+                "lists": [{"entries": [al_state]}], "hasNextChunk": False,
+            }}})
+        assert "SaveMediaListEntry" in document
+        values = json["variables"].copy()
+        assert values.pop("mediaId") == 70
+        if "scoreRaw" in values:
+            values["score"] = values.pop("scoreRaw") / 10
+        al_state.update(values)
+        writes.append("anilist")
+        return response({"data": {"SaveMediaListEntry": {"id": 1}}})
+
+    def mal_get(url, **kwargs):
+        if url.endswith("/users/@me"):
+            return response({"id": 22, "name": "mal-tester"})
+        assert url.endswith("/users/@me/animelist")
+        return response({"data": [{"node": {"id": 7, "title": "Test"}, "list_status": mal_state}], "paging": {}})
+
+    def mal_patch(url, *, data, **kwargs):
+        assert url.endswith("/anime/7/my_list_status")
+        values = data.copy()
+        if "num_watched_episodes" in values:
+            values["num_episodes_watched"] = values.pop("num_watched_episodes")
+        mal_state.update(values)
+        writes.append("mal")
+        return response(mal_state)
+
+    monkeypatch.setattr(anilist.session, "post", graphql)
+    monkeypatch.setattr(mal.session, "get", mal_get)
+    monkeypatch.setattr(mal.session, "patch", mal_patch)
+    engine = SyncEngine(anilist, mal, settings=config, history_directory=tmp_path)
+
+    assert engine.sync("anilist-to-mal").entries_synced == 1
+    assert mal_state == {
+        "status": "watching", "num_episodes_watched": 2, "score": 9,
+        "comments": "Test Ω", "num_times_rewatched": 1, "is_rewatching": False,
+    }
+    assert engine.sync("bidirectional").planned_changes == 0
+    assert al_state["score"] == 8.6
+
+    mal_state.update(status="on_hold", num_episodes_watched=3, score=7, comments="", num_times_rewatched=2)
+    assert engine.sync("bidirectional").entries_synced == 1
+    assert {key: al_state[key] for key in ("status", "progress", "score", "notes", "repeat")} == {
+        "status": "PAUSED", "progress": 3, "score": 7, "notes": "", "repeat": 2,
+    }
+    assert engine.sync("bidirectional").planned_changes == 0
+    assert writes == ["mal", "anilist"]

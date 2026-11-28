@@ -248,7 +248,10 @@ class AniListClient(BaseAPIClient):
         """
 
         try:
-            self._query(mutation, variables)
+            saved = self._query(mutation, variables).get("SaveMediaListEntry")
+            if not isinstance(saved, dict) or not saved.get("id"):
+                logger.error("AniList did not confirm the update for media ID %s", entry.anilist_id)
+                return False
             logger.info(f"Updated AniList entry: {self._safe_title(entry.title)} (episodes: {entry.episodes_watched})")
             return True
         except AuthenticationError:
