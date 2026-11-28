@@ -234,6 +234,8 @@ When adding a MAL entry to AniList, sync looks up its MAL ID directly. A single 
 
 If either service returns an incomplete list page or chunk, the run stops before planning or writing any changes. Individual titles without a safe match are skipped, and the rest of a run can continue.
 
+The MAL list reader includes all ratings so titles hidden by MAL's default API filter are still recognized as entries you already have.
+
 Sync runs use an OS-backed lock in the configured token directory, preventing separate local processes that share that directory from syncing at the same time. AniList and MAL do not provide conditional list writes here, so an external edit made after the lists are fetched can still race with a pending update.
 
 ## How It Works

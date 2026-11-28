@@ -1,7 +1,7 @@
 """MyAnimeList API client."""
 
 import logging
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from .base_client import AuthenticationError, BaseAPIClient
 from .config import Settings, get_settings
@@ -47,6 +47,7 @@ class MALClient(BaseAPIClient):
         params = {
             "fields": "list_status{status,score,num_episodes_watched,is_rewatching,updated_at,comments,num_times_rewatched},num_episodes",
             "limit": 1000,
+            "nsfw": "true",  # Read the entire account list, including titles filtered by default.
         }
         visited_urls = set()
         origin = urlsplit(self.base_url)
@@ -76,7 +77,11 @@ class MALClient(BaseAPIClient):
             url = data["paging"].get("next")
             if url is not None and (not isinstance(url, str) or not url):
                 raise ValueError("MyAnimeList returned an invalid next page URL")
-            params = {}  # Next URL already contains params
+            if url:
+                ratings = parse_qs(urlsplit(url).query, keep_blank_values=True).get("nsfw")
+                if ratings is not None and ratings != ["true"]:
+                    raise ValueError("MyAnimeList pagination changed the list's rating filter")
+                params = {"nsfw": "true"} if ratings is None else {}
 
         logger.info(f"Fetched {len(entries)} anime entries from MyAnimeList")
         return entries

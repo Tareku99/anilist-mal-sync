@@ -780,13 +780,19 @@ def test_mal_incomplete_second_page_aborts_before_list_is_used(tmp_path, monkeyp
         {"paging": {}},
     ])
 
+    list_requests = []
+
     def get(url, **kwargs):
+        if "/animelist" in url:
+            list_requests.append(kwargs["params"])
         payload = next(pages)
         return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: payload)
 
     monkeypatch.setattr(client.session, "get", get)
     with pytest.raises(ValueError, match="incomplete anime list page"):
         client.get_user_anime_list()
+    assert list_requests[0]["nsfw"] == "true"
+    assert list_requests[1] == {"nsfw": "true"}
 
 
 def test_anilist_missing_page_metadata_aborts_before_list_is_used(tmp_path, monkeypatch):
