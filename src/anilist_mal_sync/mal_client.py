@@ -127,6 +127,9 @@ class MALClient(BaseAPIClient):
 
     def update_anime(self, entry: AnimeEntry, *, fields: list[str] | None = None) -> bool:
         """Update an anime entry on MyAnimeList."""
+        if entry.is_private is not False:
+            logger.warning("Refused MAL write with private or unknown source visibility")
+            return False
         if not entry.mal_id:
             logger.warning(f"Cannot update MAL entry without mal_id: {self._safe_title(entry.title)}")
             return False

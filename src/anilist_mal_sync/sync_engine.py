@@ -203,10 +203,16 @@ class SyncEngine:
             ),
         )
 
-    def _skip_unsupported_status(
+    def _skip_blocked_entry(
         self, result: SyncResult, entry: AnimeEntry, other: AnimeEntry | None
     ) -> bool:
         entries = (entry,) if other is None else (entry, other)
+        if any(item.is_private is True for item in entries):
+            self._skip(result, entry, "private AniList entry", conflict=True)
+            return True
+        if any(item.is_private is None for item in entries):
+            self._skip(result, entry, "AniList entry visibility unavailable", conflict=True)
+            return True
         if any(item.status == WatchStatus.UNKNOWN for item in entries):
             self._skip(result, entry, "unrecognized watch status", conflict=True)
             return True
@@ -225,7 +231,7 @@ class SyncEngine:
         target_client,
         fields: list[str] | None = None,
     ) -> None:
-        if self._skip_unsupported_status(result, source_entry, target_entry):
+        if self._skip_blocked_entry(result, source_entry, target_entry):
             return
         operation = "addition" if target_entry is None else "update"
         if fields is None:
@@ -512,6 +518,11 @@ class SyncEngine:
             anilist_entry = anilist_matches[0] if anilist_matches else None
             mal_entry = mal_matches[0] if mal_matches else None
             previous = history.values(mal_id) if history is not None else None
+            if anilist_entry is not None and anilist_entry.is_private is not False:
+                if history is not None:
+                    history.clear_values(mal_id)
+                self._skip_blocked_entry(result, anilist_entry, mal_entry)
+                continue
             if previous is not None and (anilist_entry is None or mal_entry is None):
                 self._skip(
                     result, anilist_entry or mal_entry,
@@ -594,7 +605,7 @@ class SyncEngine:
         self, result: SyncResult, anilist: AnimeEntry, mal: AnimeEntry,
         history: SyncHistory, mal_id: int,
     ) -> None:
-        if self._skip_unsupported_status(result, anilist, mal):
+        if self._skip_blocked_entry(result, anilist, mal):
             history.remember(mal_id, {})
             return
         previous = history.values(mal_id) or {}
@@ -662,7 +673,7 @@ class SyncEngine:
         mal_entry: AnimeEntry,
     ) -> None:
         """Apply a clear winner or report a conflict rather than silently discarding it."""
-        if self._skip_unsupported_status(result, anilist_entry, mal_entry):
+        if self._skip_blocked_entry(result, anilist_entry, mal_entry):
             return
         fields = self._changed_fields(anilist_entry, mal_entry)
         if not fields:

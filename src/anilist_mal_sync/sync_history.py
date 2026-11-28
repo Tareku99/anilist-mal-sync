@@ -23,6 +23,11 @@ class SyncHistory:
     def remember(self, mal_id: int, agreed: dict[str, object]) -> None:
         self.entries.setdefault(str(mal_id), {}).update(agreed)
 
+    def clear_values(self, mal_id: int) -> None:
+        """Forget potentially private values while preserving that both lists saw the title."""
+        if str(mal_id) in self.entries:
+            self.entries[str(mal_id)] = {}
+
     def save(self) -> None:
         temporary = None
         try:

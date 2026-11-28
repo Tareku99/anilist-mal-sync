@@ -42,6 +42,7 @@ class AnimeEntry(BaseModel):
     rewatched: int = Field(default=0, ge=0)
     is_rewatching: bool = False
     is_favorite: bool = Field(default=False)
+    is_private: bool | None = False
 
 
 class SyncChange(BaseModel):

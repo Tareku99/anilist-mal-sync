@@ -83,6 +83,7 @@ class AniListClient(BaseAPIClient):
               entries {
                 id
                 status
+                private
                 score(format: POINT_10_DECIMAL)
                 progress
                 progressVolumes
@@ -198,6 +199,7 @@ class AniListClient(BaseAPIClient):
             notes=entry.get("notes"),
             rewatched=entry.get("repeat", 0),
             is_favorite=media.get("isFavourite", False),
+            is_private=entry.get("private") if isinstance(entry.get("private"), bool) else None,
             updated_at=updated_at,
         )
 

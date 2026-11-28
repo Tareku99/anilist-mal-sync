@@ -851,7 +851,8 @@ def test_watch_status_round_trip(tmp_path, monkeypatch, anilist_status, mal_stat
     anilist = AniListClient("fixture-token", config)
     mal = MALClient("fixture-token", config)
     al_entry = anilist._parse_entry({
-        "status": anilist_status, "media": {"id": 70, "idMal": 7, "title": {"english": "Test"}},
+        "status": anilist_status, "private": False,
+        "media": {"id": 70, "idMal": 7, "title": {"english": "Test"}},
     })
     mal_entry = mal._parse_entry({
         "list_status": {"status": mal_status}, "node": {"id": 7, "title": "Test"},
@@ -879,6 +880,7 @@ def test_real_clients_round_trip_supported_fields_and_settle(tmp_path, monkeypat
     mal = MALClient("fixture-token", config)
     al_state = {
         "id": 1, "status": "CURRENT", "progress": 2, "score": 8.6, "notes": "Test Ω",
+        "private": False,
         "repeat": 1, "media": {"id": 70, "idMal": 7, "title": {"english": "Test"}},
     }
     mal_state = {
@@ -895,6 +897,7 @@ def test_real_clients_round_trip_supported_fields_and_settle(tmp_path, monkeypat
         if "Viewer" in document:
             return response({"data": {"Viewer": {"id": 11, "name": "test-user"}}})
         if "MediaListCollection" in document:
+            assert "private" in document
             return response({"data": {"MediaListCollection": {
                 "lists": [{"entries": [al_state]}], "hasNextChunk": False,
             }}})
@@ -993,3 +996,44 @@ def test_mal_finish_without_increased_count_is_not_written_to_anilist(tmp_path):
     assert result.entries_synced == 1
     assert result.updates[0].fields == ["status", "is_rewatching", "episodes_watched", "rewatched"]
     assert anilist.updates[0].rewatched == 1
+
+
+@pytest.mark.parametrize(("mode", "has_mal_entry"), [
+    ("anilist-to-mal", False), ("anilist-to-mal", True),
+    ("mal-to-anilist", True), ("bidirectional", False), ("bidirectional", True),
+])
+@pytest.mark.parametrize("visibility", [True, None])
+def test_private_or_unknown_anilist_entries_never_write(tmp_path, mode, has_mal_entry, visibility):
+    client = AniListClient("fixture-token", settings(tmp_path))
+    payload = {
+        "status": "CURRENT", "notes": "Private note",
+        "media": {"id": 70, "idMal": 7, "title": {"english": "Test"}},
+    }
+    if visibility is True:
+        payload["private"] = True
+    anilist = FakeClient([client._parse_entry(payload)])
+    mal = FakeClient([entry(7)] if has_mal_entry else [])
+    for dry_run in (False, True):
+        result = SyncEngine(anilist, mal, settings=settings(tmp_path), dry_run=dry_run).sync(mode)
+        assert result.planned_changes == 0
+        assert result.skipped_conflicts[0].reason in {
+            "private AniList entry", "AniList entry visibility unavailable",
+        }
+        assert "Private note" not in result.model_dump_json()
+    assert not anilist.updates and not mal.updates
+
+
+def test_bidirectional_private_entry_discards_previously_agreed_notes(tmp_path):
+    anilist = FakeClient([entry(7, anilist_id=70)])
+    mal = FakeClient([entry(7)])
+    anilist.account_key, mal.account_key = "11", "22"
+    anilist.entries[0].notes = mal.entries[0].notes = "Formerly public note"
+    engine = SyncEngine(anilist, mal, settings=settings(tmp_path), history_directory=tmp_path)
+    assert engine.sync("bidirectional").planned_changes == 0
+    history_file = next(tmp_path.glob("sync-history-*.json"))
+    assert "Formerly public note" in history_file.read_text()
+
+    anilist.entries[0].is_private = True
+    assert engine.sync("bidirectional").skipped_conflicts[0].reason == "private AniList entry"
+    entries = json.loads(history_file.read_text())["entries"]
+    assert entries == {"7": {}}

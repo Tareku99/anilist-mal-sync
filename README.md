@@ -236,6 +236,8 @@ If either service returns an incomplete list page or chunk, the run stops before
 
 The MAL list reader includes all ratings so titles hidden by MAL's default API filter are still recognized as entries you already have.
 
+Private AniList entries are excluded from sync in both directions. If AniList omits an entry's privacy setting, that entry is skipped as well. The app never copies private notes into a preview or new sync history.
+
 Sync runs use an OS-backed lock in the configured token directory, preventing separate local processes that share that directory from syncing at the same time. AniList and MAL do not provide conditional list writes here, so an external edit made after the lists are fetched can still race with a pending update.
 
 ## How It Works
