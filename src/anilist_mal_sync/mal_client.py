@@ -6,6 +6,7 @@ from urllib.parse import parse_qs, urlsplit
 from .base_client import AuthenticationError, BaseAPIClient
 from .config import Settings, get_settings
 from .models import AnimeEntry, WatchStatus
+from .watch_dates import DATE_FIELDS, read_watch_dates
 
 logger = logging.getLogger(__name__)
 
@@ -44,8 +45,12 @@ class MALClient(BaseAPIClient):
         logger.info("Syncing MyAnimeList account %s", account)
         entries = []
         url = f"{self.base_url}/users/@me/animelist"
+        list_fields = (
+            "list_status{status,score,num_episodes_watched,is_rewatching,updated_at,"
+            "comments,num_times_rewatched,start_date,finish_date},num_episodes"
+        )
         params = {
-            "fields": "list_status{status,score,num_episodes_watched,is_rewatching,updated_at,comments,num_times_rewatched},num_episodes",
+            "fields": list_fields,
             "limit": 1000,
             "nsfw": "true",  # Read the entire account list, including titles filtered by default.
         }
@@ -78,10 +83,16 @@ class MALClient(BaseAPIClient):
             if url is not None and (not isinstance(url, str) or not url):
                 raise ValueError("MyAnimeList returned an invalid next page URL")
             if url:
-                ratings = parse_qs(urlsplit(url).query, keep_blank_values=True).get("nsfw")
+                query = parse_qs(urlsplit(url).query, keep_blank_values=True)
+                ratings = query.get("nsfw")
                 if ratings is not None and ratings != ["true"]:
                     raise ValueError("MyAnimeList pagination changed the list's rating filter")
                 params = {"nsfw": "true"} if ratings is None else {}
+                projection = query.get("fields")
+                if projection is None:
+                    params["fields"] = list_fields
+                elif projection != [list_fields]:
+                    raise ValueError("MyAnimeList pagination changed the requested list fields")
 
         logger.info(f"Fetched {len(entries)} anime entries from MyAnimeList")
         return entries
@@ -111,6 +122,7 @@ class MALClient(BaseAPIClient):
             from datetime import datetime
             updated_at = datetime.fromisoformat(list_status["updated_at"].replace("Z", "+00:00"))
 
+        dates, unavailable_dates = read_watch_dates(list_status, DATE_FIELDS)
         return AnimeEntry(
             mal_id=node.get("id"),
             title=node.get("title"),
@@ -122,7 +134,9 @@ class MALClient(BaseAPIClient):
             notes=list_status.get("comments"),
             rewatched=list_status.get("num_times_rewatched", 0),
             is_favorite=list_status.get("is_favoriting", False),
+            unavailable_dates=unavailable_dates,
             updated_at=updated_at,
+            **dates,
         )
 
     def update_anime(self, entry: AnimeEntry, *, fields: list[str] | None = None) -> bool:
@@ -161,6 +175,10 @@ class MALClient(BaseAPIClient):
 
         data["comments"] = entry.notes or ""
         data["num_times_rewatched"] = entry.rewatched
+        for field in DATE_FIELDS:
+            value = getattr(entry, field)
+            if field not in entry.unavailable_dates and (value or (fields and field in fields)):
+                data[field] = value or ""
         if fields is not None:
             parameter_names = {
                 "status": "status",
@@ -169,6 +187,8 @@ class MALClient(BaseAPIClient):
                 "rewatched": "num_times_rewatched",
                 "notes": "comments",
                 "score": "score",
+                "start_date": "start_date",
+                "finish_date": "finish_date",
             }
             selected = {parameter_names[field] for field in fields}
             data = {name: value for name, value in data.items() if name in selected}

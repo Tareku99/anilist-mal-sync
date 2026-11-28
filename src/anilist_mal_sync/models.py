@@ -33,8 +33,9 @@ class AnimeEntry(BaseModel):
     total_episodes: Optional[int] = None
 
     # Dates
-    start_date: Optional[datetime] = None
-    finish_date: Optional[datetime] = None
+    start_date: str | None = None
+    finish_date: str | None = None
+    unavailable_dates: set[str] = Field(default_factory=set)
     updated_at: Optional[datetime] = None
 
     # Additional metadata

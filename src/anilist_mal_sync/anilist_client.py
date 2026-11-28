@@ -6,6 +6,7 @@ from typing import Optional
 from .base_client import AuthenticationError, BaseAPIClient
 from .config import Settings, get_settings
 from .models import AnimeEntry, WatchStatus
+from .watch_dates import DATE_FIELDS, anilist_watch_date, read_watch_dates
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +188,9 @@ class AniListClient(BaseAPIClient):
             from datetime import datetime, timezone
             updated_at = datetime.fromtimestamp(entry["updatedAt"], tz=timezone.utc)
 
+        dates, unavailable_dates = read_watch_dates(
+            entry, ("startedAt", "completedAt"), keys_required=True,
+        )
         return AnimeEntry(
             anilist_id=media.get("id"),
             mal_id=media.get("idMal"),
@@ -200,7 +204,9 @@ class AniListClient(BaseAPIClient):
             rewatched=entry.get("repeat", 0),
             is_favorite=media.get("isFavourite", False),
             is_private=entry.get("private") if isinstance(entry.get("private"), bool) else None,
+            unavailable_dates=unavailable_dates,
             updated_at=updated_at,
+            **dates,
         )
 
     def update_anime(self, entry: AnimeEntry, *, fields: list[str] | None = None) -> bool:
@@ -227,6 +233,10 @@ class AniListClient(BaseAPIClient):
             "rewatched": ("repeat", "Int", entry.rewatched),
             "notes": ("notes", "String", entry.notes or ""),
         }
+        for field, name in zip(DATE_FIELDS, ("startedAt", "completedAt")):
+            value = getattr(entry, field)
+            if field not in entry.unavailable_dates and (value or (fields and field in fields)):
+                candidates[field] = (name, "FuzzyDateInput", anilist_watch_date(value))
         if self.settings.score_sync_mode == "auto":
             normalized_score = entry.score
             if normalized_score is not None and normalized_score <= 10:

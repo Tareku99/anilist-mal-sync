@@ -798,7 +798,8 @@ def test_mal_incomplete_second_page_aborts_before_list_is_used(tmp_path, monkeyp
     with pytest.raises(ValueError, match="incomplete anime list page"):
         client.get_user_anime_list()
     assert list_requests[0]["nsfw"] == "true"
-    assert list_requests[1] == {"nsfw": "true"}
+    assert list_requests[1]["nsfw"] == "true"
+    assert list_requests[1]["fields"] == list_requests[0]["fields"]
 
 
 def test_anilist_missing_page_metadata_aborts_before_list_is_used(tmp_path, monkeypatch):
@@ -881,6 +882,8 @@ def test_real_clients_round_trip_supported_fields_and_settle(tmp_path, monkeypat
     al_state = {
         "id": 1, "status": "CURRENT", "progress": 2, "score": 8.6, "notes": "Test Ω",
         "private": False,
+        "startedAt": {"year": None, "month": None, "day": None},
+        "completedAt": {"year": None, "month": None, "day": None},
         "repeat": 1, "media": {"id": 70, "idMal": 7, "title": {"english": "Test"}},
     }
     mal_state = {
@@ -1063,3 +1066,93 @@ def test_disabling_score_sync_omits_ratings_from_both_api_payloads(tmp_path, mon
     target = FakeClient([entry(7, score=4, episodes=0)])
     plan = SyncEngine(source, target, settings=config, dry_run=True).sync("anilist-to-mal")
     assert plan.updates[0].fields == ["episodes_watched"]
+
+
+def test_bidirectional_watch_dates_fill_blanks_and_follow_confirmed_edits(tmp_path):
+    al_entry, mal_entry = entry(7, anilist_id=70), entry(7)
+    al_entry.start_date = "2024-02"
+    mal_entry.finish_date = "2024-03-01"
+    anilist, mal = FakeClient([al_entry]), FakeClient([mal_entry])
+    anilist.account_key, mal.account_key = "11", "22"
+    engine = SyncEngine(anilist, mal, settings=settings(tmp_path), history_directory=tmp_path)
+    result = engine.sync("bidirectional")
+    assert [(item.target, item.fields) for item in result.updates] == [
+        ("mal", ["start_date"]), ("anilist", ["finish_date"]),
+    ]
+    assert not result.skipped_conflicts
+
+    # Simulate both services returning the writes, then one side clearing an agreed date.
+    mal_entry.start_date = "2024-02"
+    al_entry.finish_date = "2024-03-01"
+    assert engine.sync("bidirectional").planned_changes == 0
+    mal_entry.finish_date = None
+    result = engine.sync("bidirectional")
+    assert result.updates[0].target == "anilist"
+    assert result.updates[0].differences == {"finish_date": {"from": "2024-03-01", "to": None}}
+
+
+@pytest.mark.parametrize(("mal_start", "mal_finish", "expected"), [
+    ("2024-02-02", None, "watch dates disagree"),
+    (None, "2023-12", "start after the finish"),
+])
+def test_watch_date_conflicts_are_never_written(tmp_path, mal_start, mal_finish, expected):
+    a, m = entry(7, anilist_id=70), entry(7)
+    a.start_date = "2024-02-01"
+    if mal_finish:
+        a.finish_date = mal_finish
+    m.start_date, m.finish_date = mal_start, mal_finish
+    anilist, mal = FakeClient([a]), FakeClient([m])
+    anilist.account_key, mal.account_key = "11", "22"
+    result = SyncEngine(
+        anilist, mal, settings=settings(tmp_path), history_directory=tmp_path,
+    ).sync("bidirectional")
+    assert result.planned_changes == 0
+    assert expected in result.skipped_conflicts[0].reason
+    assert not anilist.updates and not mal.updates
+
+
+def test_watch_date_requests_preserve_partial_precision_and_explicit_clear(tmp_path, monkeypatch):
+    config = settings(tmp_path)
+    anilist, mal = AniListClient("fixture-token", config), MALClient("fixture-token", config)
+    anime = anilist._parse_entry({
+        "status": "CURRENT", "private": False, "startedAt": {"year": 2024, "month": 2, "day": None},
+        "completedAt": {"year": None, "month": None, "day": None},
+        "media": {"id": 70, "idMal": 7, "title": {"english": "Test"}},
+    })
+    assert (anime.start_date, anime.finish_date) == ("2024-02", None)
+
+    def mutate(document, variables):
+        assert variables == {
+            "mediaId": 70, "startedAt": {"year": 2024, "month": 2, "day": None},
+            "completedAt": {"year": None, "month": None, "day": None},
+        }
+        return {"SaveMediaListEntry": {"id": 1}}
+
+    def patch(url, *, data, **kwargs):
+        assert data == {"start_date": "2024-02", "finish_date": ""}
+        return SimpleNamespace(status_code=200, raise_for_status=lambda: None)
+
+    monkeypatch.setattr(anilist, "_query", mutate)
+    monkeypatch.setattr(mal.session, "patch", patch)
+    fields = ["start_date", "finish_date"]
+    assert anilist.update_anime(anime, fields=fields)
+    assert mal.update_anime(anime, fields=fields)
+    invalid = anilist._parse_entry({
+        "status": "CURRENT", "private": False, "startedAt": {"month": 2},
+        "media": {"id": 70, "idMal": 7, "title": {"english": "Test"}},
+    })
+    assert invalid.unavailable_dates == {"start_date", "finish_date"}
+
+
+def test_matching_partial_watch_date_is_upgraded_without_guessing(tmp_path):
+    a, m = entry(7, anilist_id=70), entry(7)
+    a.start_date, m.start_date = "2024", "2024-02-29"
+    anilist, mal = FakeClient([a]), FakeClient([m])
+    anilist.account_key, mal.account_key = "11", "22"
+    result = SyncEngine(
+        anilist, mal, settings=settings(tmp_path), history_directory=tmp_path,
+    ).sync("bidirectional")
+    assert result.updates[0].target == "anilist"
+    assert result.updates[0].differences == {
+        "start_date": {"from": "2024", "to": "2024-02-29"},
+    }

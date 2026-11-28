@@ -240,6 +240,8 @@ Private AniList entries are excluded from sync in both directions. If AniList om
 
 With `sync.score_sync_mode: auto`, fractional AniList scores are compared at MAL's whole-number precision. When the scores are equivalent at that precision, an update to another field preserves the finer AniList score. Set `sync.score_sync_mode: disabled` to keep ratings independent, including for newly added titles.
 
+Start and finish dates sync by default. Bidirectional sync fills in a missing date from the other service and keeps year-only and year/month precision. Once both sides have agreed on a date, a clear on one side can sync too. Conflicting dates, unsupported date formats, and changes that would place a start after its finish are reported instead of written.
+
 Sync runs use an OS-backed lock in the configured token directory, preventing separate local processes that share that directory from syncing at the same time. AniList and MAL do not provide conditional list writes here, so an external edit made after the lists are fetched can still race with a pending update.
 
 ## How It Works
