@@ -58,43 +58,25 @@ def _release_process_sync_lock(lock_file) -> None:
     lock_file.close()
 
 
-def authenticate_services(settings: Settings, token_manager: TokenManager) -> tuple[Optional[str], Optional[str]]:
-    """Authenticate both services and return tokens.
-    
-    Returns:
-        tuple: (anilist_token, mal_token) or (None, None) if failed
-    """
-    logger.info("No authentication found - starting automatic OAuth flow...")
-    logger.info("")
-    
-    auth_success = True
-    
-    for service in ["anilist", "mal"]:
-        logger.info(f"Authenticating {service.upper()}...")
+def authenticate_services(
+    settings: Settings,
+    token_manager: TokenManager,
+    anilist_token: str | None = None,
+    mal_token: str | None = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Authorize only missing services and preserve any successful authorization."""
+    tokens = {"anilist": anilist_token, "mal": mal_token}
+    for service, token in tokens.items():
+        if token:
+            continue
+        logger.info("Authorizing %s...", service)
         try:
-            if not run_oauth_flow(service, settings, token_manager):
-                logger.error(f"Failed to authenticate {service.upper()}")
-                auth_success = False
-        except Exception as auth_error:
-            logger.error(f"Error during {service.upper()} authentication: {auth_error}")
-            auth_success = False
-    
-    if not auth_success:
-        logger.error("Authentication failed. Please try running: anilist-mal-sync auth")
-        return None, None
-    
-    # Reload tokens after successful auth
-    anilist_token = token_manager.get_valid_token("anilist", settings)
-    mal_token = token_manager.get_valid_token("mal", settings, refresh_mal_token)
-    
-    if not anilist_token or not mal_token:
-        logger.error("Failed to load tokens after authentication")
-        return None, None
-    
-    logger.info("")
-    logger.info("Authentication successful! Starting sync...")
-    logger.info("")
-    return anilist_token, mal_token
+            if run_oauth_flow(service, settings, token_manager):
+                refresher = refresh_mal_token if service == "mal" else None
+                tokens[service] = token_manager.get_valid_token(service, settings, refresher)
+        except Exception as error:
+            logger.error("Authorization failed for %s: %s", service, error)
+    return tokens["anilist"], tokens["mal"]
 
 
 def reauthenticate_services(settings: Settings, token_manager: TokenManager) -> tuple[Optional[str], Optional[str]]:
@@ -195,6 +177,7 @@ def _authentication_failure_result(
         else SyncResult(success=False, dry_run=dry_run)
     )
     result.success = False
+    result.authentication_required = [service]
     result.entries_synced = successful_writes
     result.entries_failed += 1
     result.errors.append(f"Authentication recovery failed for {service}")
@@ -208,6 +191,7 @@ def _execute_sync_unlocked(
     anilist_token: Optional[str] = None,
     mal_token: Optional[str] = None,
     token_manager: Optional[TokenManager] = None,
+    mal_ids: frozenset[int] = frozenset(),
 ) -> tuple[bool, Optional[SyncResult]]:
     """Execute a sync operation.
     
@@ -250,9 +234,15 @@ def _execute_sync_unlocked(
     
     # Authenticate if tokens are missing
     if not anilist_token or not mal_token:
-        anilist_token, mal_token = authenticate_services(settings, token_manager)
+        anilist_token, mal_token = authenticate_services(
+            settings, token_manager, anilist_token, mal_token
+        )
         if not anilist_token or not mal_token:
-            return False, None
+            missing = [name for name, token in (("anilist", anilist_token), ("mal", mal_token)) if not token]
+            return False, SyncResult(
+                success=False, dry_run=dry_run, entries_failed=1, authentication_required=missing,
+                errors=["Authorization required: " + ", ".join(missing)],
+            )
     
     successful_writes_before_retry = 0
     last_partial_result = None
@@ -266,6 +256,8 @@ def _execute_sync_unlocked(
                 mal_client,
                 dry_run=dry_run,
                 settings=settings,
+                history_directory=settings.token_file.parent,
+                mal_ids=mal_ids,
             )
             result = engine.sync(mode)
             result.entries_synced += successful_writes_before_retry
@@ -323,6 +315,7 @@ def execute_sync(
     anilist_token: Optional[str] = None,
     mal_token: Optional[str] = None,
     token_manager: Optional[TokenManager] = None,
+    mal_ids: frozenset[int] = frozenset(),
 ) -> tuple[bool, Optional[SyncResult]]:
     """Serialize syncs across processes sharing the configured token directory."""
     if settings is None:
@@ -344,9 +337,18 @@ def execute_sync(
             anilist_token=anilist_token,
             mal_token=mal_token,
             token_manager=token_manager,
+            mal_ids=mal_ids,
         )
     finally:
         _release_process_sync_lock(lock_file)
+
+
+def sync_readiness(result: SyncResult | None, completed: bool) -> str:
+    if result and result.authentication_required:
+        labels = {"anilist": "AniList", "mal": "MAL"}
+        services = ", ".join(labels.get(service, service) for service in result.authentication_required)
+        return f"Authorization required: {services}"
+    return "Ready" if completed and result and result.success else "Error"
 
 
 def print_sync_results(result, mode: str):
@@ -372,7 +374,8 @@ def print_sync_results(result, mode: str):
             "skipped": [change.model_dump(mode="json") for change in result.skipped],
             "errors": result.errors,
         }
-        click.echo(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+        # Escapes preserve Unicode when output is redirected through a Windows code page.
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
         return
     
     click.echo("\n=== Sync Results ===")
@@ -380,6 +383,10 @@ def print_sync_results(result, mode: str):
     click.echo(f"Success: {result.success}")
     click.echo(f"Entries synced: {result.entries_synced}")
     click.echo(f"Entries failed: {result.entries_failed}")
+    click.echo(f"Conflicts skipped: {len(result.skipped_conflicts)}")
+    for conflict in result.skipped_conflicts[:10]:
+        click.echo(f"  - {conflict.title}: {conflict.reason}")
+    click.echo(f"Other entries skipped: {result.entries_skipped}")
     
     if result.errors:
         click.echo(f"\nErrors ({len(result.errors)}):")

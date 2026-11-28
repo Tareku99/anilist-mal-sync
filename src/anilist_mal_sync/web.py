@@ -1,34 +1,80 @@
 """
-Web UI for AniList-MAL Sync
+Web UI for AniList–MAL Sync
 Provides a simple dashboard for monitoring and controlling the sync service.
 """
 
 import logging
 import os
+import secrets
+import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Annotated
+
 import yaml
-
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from pydantic import BaseModel, Field, ValidationError
 
-from .config import get_settings, reload_settings
-from .sync_service import execute_sync, print_sync_results
+from .config import Config, get_settings, reload_settings, validate_credentials
+from .models import SyncResult
+from .sync_service import execute_sync, sync_readiness
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="AniList-MAL Sync", version="0.1.0")
+_basic_auth = HTTPBasic(auto_error=False)
+_SECRET_MASK = "<stored secret>"
+
+
+def _check_dashboard_access(
+    request: Request,
+    credentials: Annotated[HTTPBasicCredentials | None, Depends(_basic_auth)],
+):
+    password = os.environ.get("SYNC_DASHBOARD_PASSWORD")
+    if password and (
+        credentials is None
+        or credentials.username != "admin"
+        or not secrets.compare_digest(credentials.password.encode(), password.encode())
+    ):
+        raise HTTPException(401, "Dashboard sign-in required", headers={"WWW-Authenticate": "Basic"})
+    if request.method == "POST" and request.headers.get("X-Sync-Dashboard") != "1":
+        raise HTTPException(403, "Dashboard write header required")
+
+
+app = FastAPI(
+    title="AniList–MAL Sync", version="0.1.0",
+    dependencies=[Depends(_check_dashboard_access)],
+)
+
+
+def _mask_config_secrets(config: dict, existing: dict | None = None) -> None:
+    """Mask existing secrets on read and restore untouched secrets on save."""
+    for service in ("anilist", "mal", "myanimelist"):
+        section = config.get(service)
+        if not isinstance(section, dict) or "client_secret" not in section:
+            continue
+        if existing is None and section["client_secret"]:
+            section["client_secret"] = _SECRET_MASK
+        elif existing is not None and section["client_secret"] == _SECRET_MASK:
+            stored = (existing.get(service) or {}).get("client_secret")
+            if not stored:
+                raise ValueError("No saved secret exists for this service")
+            section["client_secret"] = stored
 
 # Global state for sync status
 sync_status = {
     "running": False,
     "last_sync": None,
+    "last_successful_sync": None,
     "next_sync": None,
     "last_result": None,
     "total_syncs": 0,
+    "preview": None,
+    "last_manual_success": None,
+    "accounts": {},
+    "sync_readiness": "Not checked",
 }
 
 # Threading lock to prevent concurrent syncs
@@ -49,11 +95,17 @@ def _get_config_path() -> Path:
 class SyncStatus(BaseModel):
     """Sync status response model"""
     running: bool
-    last_sync: Optional[str] = None
-    next_sync: Optional[str] = None
-    last_result: Optional[str] = None
+    last_sync: str | None = None
+    last_successful_sync: str | None = None
+    next_sync: str | None = None
+    last_result: str | None = None
     total_syncs: int
     sync_in_progress: bool = False  # True if any sync (scheduled or manual) is running
+    preview_only: bool = False
+    last_manual_success: bool | None = None
+    accounts: dict[str, str] = Field(default_factory=dict)
+    sync_readiness: str = "Not checked"
+    preview: SyncResult | None = None
 
 
 class ConfigUpdate(BaseModel):
@@ -64,34 +116,28 @@ class ConfigUpdate(BaseModel):
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
     """Main dashboard page"""
-    html_content = """
+    html_content = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AniList-MAL Sync Dashboard</title>
+    <title>AniList–MAL Sync Dashboard</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        html, body {
-            height: 100%;
-            overflow: hidden;
-        }
+        [hidden] { display: none !important; }
         body {
+            min-height: 100vh;
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%) fixed;
             padding: 15px;
-            overflow-x: hidden;
-            overflow-y: hidden;
             display: flex;
             flex-direction: column;
         }
         .container { 
-            max-width: 95%; 
+            width: min(100%, 1300px);
             margin: 0 auto; 
             padding: 0 10px; 
-            overflow-x: hidden; 
-            overflow-y: hidden;
             flex: 1;
             display: flex;
             flex-direction: column;
@@ -107,14 +153,14 @@ async def dashboard():
         .header p { opacity: 0.9; font-size: 0.95em; }
         .cards {
             display: grid;
-            grid-template-columns: 1fr 2fr;
+            grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
             gap: 20px;
             margin-bottom: 15px;
             flex: 1;
             min-height: 0;
         }
         @media (max-width: 1024px) {
-            .cards { grid-template-columns: 1fr; }
+            .cards { grid-template-columns: minmax(0, 1fr); }
         }
         .card {
             background: white;
@@ -126,10 +172,9 @@ async def dashboard():
             height: fit-content;
         }
         .card.config-card {
-            height: 100%;
+            min-height: 25rem;
             display: flex;
             flex-direction: column;
-            min-height: 0;
         }
         .card h2 {
             color: #667eea;
@@ -139,12 +184,13 @@ async def dashboard():
         .status-item {
             display: flex;
             justify-content: space-between;
+            gap: 0.75rem;
             padding: 10px 0;
             border-bottom: 1px solid #eee;
         }
         .status-item:last-child { border-bottom: none; }
         .status-label { font-weight: 600; color: #555; }
-        .status-value { color: #333; }
+        .status-value { color: #333; text-align: right; overflow-wrap: anywhere; }
         .status-running { color: #10b981; font-weight: bold; }
         .status-stopped { color: #ef4444; font-weight: bold; }
         .btn {
@@ -157,7 +203,6 @@ async def dashboard():
             cursor: pointer;
             font-size: 16px;
             font-weight: 600;
-            transition: background 0.2s;
             width: 100%;
             margin-top: 10px;
         }
@@ -172,7 +217,7 @@ async def dashboard():
         .config-editor {
             width: 100%;
             flex: 1;
-            min-height: 0;
+            min-height: 18rem;
             font-family: 'Courier New', monospace;
             font-size: 15px;
             line-height: 1.6;
@@ -233,7 +278,7 @@ async def dashboard():
 <body>
     <div class="container">
         <div class="header">
-            <h1>🔄 AniList-MAL Sync</h1>
+            <h1>🔄 AniList–MAL Sync</h1>
             <p>Monitor and control your anime list synchronization</p>
         </div>
 
@@ -241,12 +286,24 @@ async def dashboard():
             <div class="card">
                 <h2>📊 Status</h2>
                 <div class="status-item">
-                    <span class="status-label">Service:</span>
+                    <span class="status-label">Scheduler:</span>
                     <span class="status-value" id="status-running">Loading...</span>
                 </div>
                 <div class="status-item">
-                    <span class="status-label">Last Sync:</span>
+                    <span class="status-label">Sync Readiness:</span>
+                    <span class="status-value" id="status-readiness">—</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Last Verified Accounts:</span>
+                    <span class="status-value" id="status-accounts">—</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Last Attempt:</span>
                     <span class="status-value" id="status-last-sync">-</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Last Successful Sync:</span>
+                    <span class="status-value" id="status-last-success">-</span>
                 </div>
                 <div class="status-item">
                     <span class="status-label">Next Sync:</span>
@@ -257,21 +314,28 @@ async def dashboard():
                     <span class="status-value" id="status-last-result">-</span>
                 </div>
                 <div class="status-item">
-                    <span class="status-label">Total Syncs:</span>
+                    <span class="status-label">Total Attempts:</span>
                     <span class="status-value" id="status-total-syncs">0</span>
                 </div>
-                <button class="btn btn-secondary" id="sync-now-btn" onclick="triggerSync(event)">▶️ Sync Now</button>
+                <button class="btn btn-secondary" id="sync-now-btn" onclick="triggerSync(false)" disabled>▶️ Sync Now</button>
+                <button class="btn" id="preview-btn" onclick="triggerSync(true)" disabled>Preview Sync</button>
                 <button class="btn" id="refresh-btn" onclick="refreshStatus()">🔄 Refresh Status</button>
+                <div class="message" id="sync-message" role="status"></div>
+                <div class="message" id="status-message" role="status"></div>
+                <details id="preview-details" hidden>
+                    <summary>Last preview</summary>
+                    <pre id="preview-content" style="white-space: pre-wrap; max-height: 18rem; overflow: auto"></pre>
+                </details>
             </div>
 
             <div class="card config-card">
                 <h2>⚙️ Configuration</h2>
                 <div style="flex: 1; display: flex; flex-direction: column; min-height: 0;">
-                    <textarea class="config-editor" id="config-editor" placeholder="Loading configuration..."></textarea>
+                    <textarea class="config-editor" id="config-editor" aria-label="YAML configuration" placeholder="Loading configuration..." disabled></textarea>
                 </div>
-                <button class="btn" onclick="loadConfig()">📥 Reload Config</button>
-                <button class="btn btn-secondary" onclick="saveConfig()">💾 Save Config</button>
-                <div class="message" id="config-message"></div>
+                <button class="btn" id="reload-config-btn" onclick="loadConfig()">📥 Reload Config</button>
+                <button class="btn btn-secondary" id="save-config-btn" onclick="saveConfig()" disabled>💾 Save Config</button>
+                <div class="message" id="config-message" role="status"></div>
                 <div class="info-note">
                     ℹ️ <strong>Note:</strong> Most configuration changes are automatically reloaded. CLI parameters (interval, port, host) require a manual restart.
                 </div>
@@ -279,7 +343,7 @@ async def dashboard():
         </div>
 
         <div class="footer">
-            <p>AniList-MAL Sync v0.1.0 | Made with ❤️</p>
+            <p>AniList–MAL Sync v0.1.0 | Made with ❤️</p>
             <p style="margin-top: 10px;">
                 <a href="https://ko-fi.com/tareku" target="_blank" rel="noopener noreferrer" style="color: white; text-decoration: none; opacity: 0.9; transition: opacity 0.2s;">
                     ☕ Support the project on <strong>Ko-fi</strong>
@@ -289,127 +353,199 @@ async def dashboard():
     </div>
 
     <script>
-        // Status update function - updates all status fields and button states
-        async function updateStatus() {
-            try {
-                const response = await fetch('/api/status');
-                const data = await response.json();
-                
-                // Update status fields
-                document.getElementById('status-running').textContent = data.running ? 'Running' : 'Stopped';
-                document.getElementById('status-running').className = data.running ? 'status-value status-running' : 'status-value status-stopped';
-                document.getElementById('status-last-sync').textContent = data.last_sync || '-';
-                document.getElementById('status-next-sync').textContent = data.next_sync || '-';
-                document.getElementById('status-last-result').textContent = data.last_result || '-';
-                document.getElementById('status-total-syncs').textContent = data.total_syncs;
-                
-                // Update sync button state
-                const syncBtn = document.getElementById('sync-now-btn');
-                syncBtn.disabled = data.sync_in_progress;
-                syncBtn.textContent = data.sync_in_progress ? '⏳ Syncing...' : '▶️ Sync Now';
-            } catch (error) {
-                console.error('Failed to fetch status:', error);
+        const byId = (id) => document.getElementById(id);
+        let currentStatus = null;
+        let statusRequest = null;
+        let pollTimer;
+        let action = null;
+        let starting = false;
+        let configBusy = false;
+        let configLoaded = false;
+
+        async function requestJson(url, options = {}) {
+            const response = await fetch(url, {
+                cache: 'no-store', signal: AbortSignal.timeout(10000), ...options
+            });
+            const data = await response.json().catch(() => null);
+            if (!response.ok || !data) {
+                throw new Error(data?.detail || 'Request failed (' + response.status + ')');
+            }
+            return data;
+        }
+
+        function showMessage(id, message, type = '') {
+            const element = byId(id);
+            element.textContent = message;
+            element.className = message ? 'message show ' + type : 'message';
+        }
+
+        function renderButtons() {
+            const busy = Boolean(action || currentStatus?.sync_in_progress);
+            const syncBtn = byId('sync-now-btn');
+            const previewBtn = byId('preview-btn');
+            syncBtn.hidden = Boolean(currentStatus?.preview_only);
+            syncBtn.disabled = !currentStatus || busy;
+            previewBtn.disabled = !currentStatus || busy;
+            syncBtn.textContent = action === 'sync' ? 'Syncing…' : 'Sync Now';
+            previewBtn.textContent = action === 'preview' ? 'Previewing…' : 'Preview Sync';
+        }
+
+        function renderStatus(data) {
+            byId('status-running').textContent = data.running ? 'Running' : 'Inactive';
+            byId('status-readiness').textContent = data.sync_readiness;
+            const accounts = data.accounts || {};
+            byId('status-accounts').textContent = accounts.anilist && accounts.mal
+                ? 'AniList: ' + accounts.anilist + ' · MAL: ' + accounts.mal
+                : '—';
+            byId('status-running').className = 'status-value ' + (data.running ? 'status-running' : 'status-stopped');
+            byId('status-last-sync').textContent = data.last_sync || '—';
+            byId('status-last-success').textContent = data.last_successful_sync || '—';
+            byId('status-next-sync').textContent = data.next_sync || '—';
+            byId('status-last-result').textContent = data.last_result || '—';
+            byId('status-total-syncs').textContent = data.total_syncs;
+
+            const completed = action && !starting && !data.sync_in_progress ? action : null;
+            if (completed) {
+                action = null;
+                const failed = data.last_manual_success === false;
+                showMessage('sync-message', data.last_result || 'Finished', failed ? 'error' : 'success');
+            } else if (!action && data.sync_in_progress) {
+                showMessage('sync-message', 'A sync is already running.');
+            } else if (!action && currentStatus?.sync_in_progress) {
+                showMessage('sync-message', '');
+            }
+
+            const details = byId('preview-details');
+            details.hidden = !data.preview;
+            if (data.preview) {
+                const lines = [];
+                for (const [label, entries] of [
+                    ['Additions', data.preview.additions], ['Updates', data.preview.updates],
+                    ['Conflicts', data.preview.skipped_conflicts],
+                    ['Other skips', data.preview.skipped.filter(change => change.reason !== 'already in sync')],
+                ]) {
+                    if (!entries.length) continue;
+                    lines.push(label + ' (' + entries.length + ')');
+                    for (const change of entries) {
+                        const direction = change.source && change.target ? ' (' + change.source + ' → ' + change.target + ')' : '';
+                        const explanation = change.reason || Object.entries(change.differences).map(([field, values]) =>
+                            field + ': ' + JSON.stringify(values.from) + ' → ' + JSON.stringify(values.to)
+                        ).join(', ');
+                        lines.push('• ' + change.title + direction + ': ' + explanation);
+                    }
+                    lines.push('');
+                }
+                byId('preview-content').textContent = lines.concat(data.preview.errors).join('\n').trim() || 'No changes planned.';
+                if (completed === 'preview') details.open = true;
             }
         }
 
-        // Refresh status with button feedback
+        function updateStatus() {
+            if (statusRequest) return statusRequest;
+            clearTimeout(pollTimer);
+            statusRequest = (async () => {
+                try {
+                    const data = await requestJson('/api/status');
+                    renderStatus(data);
+                    currentStatus = data;
+                    showMessage('status-message', '');
+                } catch (error) {
+                    showMessage('status-message', 'Could not refresh status. Retrying automatically.', 'error');
+                } finally {
+                    statusRequest = null;
+                    renderButtons();
+                    pollTimer = setTimeout(updateStatus, action || currentStatus?.sync_in_progress ? 700 : 5000);
+                }
+            })();
+            return statusRequest;
+        }
+
         async function refreshStatus() {
-            const btn = document.getElementById('refresh-btn');
-            const originalText = btn.textContent;
-            btn.disabled = true;
-            btn.textContent = '🔄 Refreshing...';
-            
+            const button = byId('refresh-btn');
+            button.disabled = true;
+            button.textContent = 'Refreshing…';
             try {
                 await updateStatus();
             } finally {
-                setTimeout(() => {
-                    btn.disabled = false;
-                    btn.textContent = originalText;
-                }, 300);
+                button.disabled = false;
+                button.textContent = 'Refresh Status';
             }
         }
 
-        // Load configuration
+        function setConfigBusy(operation) {
+            configBusy = Boolean(operation);
+            byId('config-editor').disabled = configBusy || !configLoaded;
+            byId('save-config-btn').disabled = configBusy || !configLoaded;
+            byId('reload-config-btn').disabled = configBusy;
+            byId('reload-config-btn').textContent = operation === 'load' ? 'Loading…' : 'Reload Config';
+            byId('save-config-btn').textContent = operation === 'save' ? 'Saving…' : 'Save Config';
+        }
+
         async function loadConfig() {
+            if (configBusy) return;
+            setConfigBusy('load');
             try {
-                const response = await fetch('/api/config');
-                const data = await response.json();
-                document.getElementById('config-editor').value = data.config;
-                showMessage('config-message', 'Configuration loaded successfully', 'success');
+                const data = await requestJson('/api/config');
+                byId('config-editor').value = data.config;
+                configLoaded = true;
+                showMessage('config-message', '');
             } catch (error) {
-                showMessage('config-message', 'Failed to load configuration', 'error');
+                showMessage('config-message', 'Could not load configuration: ' + error.message, 'error');
+            } finally {
+                setConfigBusy(null);
             }
         }
 
-        // Save configuration
         async function saveConfig() {
-            const config = document.getElementById('config-editor').value;
+            if (configBusy || !configLoaded) return;
+            setConfigBusy('save');
             try {
-                const response = await fetch('/api/config', {
+                await requestJson('/api/config', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ config }),
+                    headers: { 'Content-Type': 'application/json', 'X-Sync-Dashboard': '1' },
+                    body: JSON.stringify({ config: byId('config-editor').value })
                 });
-                
-                if (!response.ok) {
-                    const error = await response.json();
-                    throw new Error(error.detail || 'Failed to save config');
-                }
-                
-                showMessage('config-message', 'Configuration saved successfully! It will be reloaded automatically.', 'success');
+                // Reload the masked version so pasted secrets do not stay in the editor.
+                byId('config-editor').value = '';
+                configLoaded = false;
+                setConfigBusy(null);
+                await loadConfig();
+                if (configLoaded) showMessage('config-message', 'Configuration saved.', 'success');
+                else showMessage('config-message', 'Configuration saved. Reload the editor to see it.', 'error');
             } catch (error) {
                 showMessage('config-message', error.message, 'error');
+            } finally {
+                setConfigBusy(null);
             }
         }
 
-        // Trigger manual sync
-        async function triggerSync(event) {
-            if (event) {
-                event.preventDefault();
-                event.stopPropagation();
-            }
-            
-            const btn = document.getElementById('sync-now-btn');
-            if (btn.disabled) return;
-            
-            btn.disabled = true;
-            btn.textContent = '⏳ Syncing...';
-            
+        async function triggerSync(preview) {
+            if (action || !currentStatus || currentStatus.sync_in_progress) return;
+            action = preview ? 'preview' : 'sync';
+            starting = true;
+            renderButtons();
+            showMessage('sync-message', preview ? 'Preparing preview…' : 'Starting sync…');
+            if (preview) byId('preview-details').hidden = true;
+
             try {
-                const response = await fetch('/api/sync/trigger', { method: 'POST' });
-                if (!response.ok) {
-                    const error = await response.json();
-                    throw new Error(error.detail || 'Sync failed');
-                }
-                
-                // Poll for completion
-                const checkInterval = setInterval(async () => {
-                    await updateStatus();
-                    const statusResponse = await fetch('/api/status');
-                    const statusData = await statusResponse.json();
-                    if (!statusData.sync_in_progress) {
-                        clearInterval(checkInterval);
-                    }
-                }, 1000);
+                await requestJson('/api/sync/trigger?preview=' + preview, {
+                    method: 'POST', headers: { 'X-Sync-Dashboard': '1' }
+                });
+                if (statusRequest) await statusRequest;
+                starting = false;
+                await updateStatus();
             } catch (error) {
-                console.error('Failed to trigger sync:', error);
-                await updateStatus(); // Restore button state
+                action = null;
+                starting = false;
+                showMessage('sync-message', error.message, 'error');
+                renderButtons();
+                await updateStatus();
             }
         }
 
-        // Show message
-        function showMessage(elementId, message, type) {
-            const msgEl = document.getElementById(elementId);
-            msgEl.textContent = message;
-            msgEl.className = `message ${type} show`;
-            setTimeout(() => msgEl.classList.remove('show'), 5000);
-        }
-
-        // Initialize on page load
         window.addEventListener('DOMContentLoaded', () => {
             updateStatus();
             loadConfig();
-            setInterval(updateStatus, 30000); // Auto-refresh every 30 seconds
         });
     </script>
 </body>
@@ -421,8 +557,16 @@ async def dashboard():
 @app.get("/api/status")
 async def get_status() -> SyncStatus:
     """Get current sync status"""
+    in_progress = is_sync_running()
     status_dict = sync_status.copy()
-    status_dict["sync_in_progress"] = is_sync_running()
+    status_dict["sync_in_progress"] = in_progress
+    status_dict["preview_only"] = bool(_cli_dry_run)
+    if not status_dict["preview_only"]:
+        try:
+            status_dict["preview_only"] = get_settings().dry_run
+        except (OSError, ValueError, TypeError, yaml.YAMLError):
+            # Keep status and config editing available while configuration is invalid.
+            pass
     return SyncStatus(**status_dict)
 
 
@@ -434,101 +578,108 @@ async def get_config():
         if not config_path.exists():
             raise HTTPException(status_code=404, detail="Config file not found")
         
-        with open(config_path, "r") as f:
-            return {"config": f.read()}
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        _mask_config_secrets(config)
+        return {"config": yaml.safe_dump(config, sort_keys=False)}
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Failed to load config: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except (OSError, ValueError, TypeError, AttributeError, yaml.YAMLError):
+        logger.error("Failed to load dashboard configuration")
+        raise HTTPException(status_code=500, detail="Could not read configuration")
 
 
 @app.post("/api/config")
 async def update_config(data: ConfigUpdate):
     """Update configuration file"""
     config_path = _get_config_path()
-    backup_path = config_path.parent / "config.yaml.backup"
-    
+    temp_path = None
     try:
-        # Validate YAML syntax
-        yaml.safe_load(data.config)
-        
-        # Backup existing config
-        if config_path.exists():
-            with open(config_path, "r") as f:
-                backup_content = f.read()
-            with open(backup_path, "w") as f:
-                f.write(backup_content)
-        
-        # Write new config
-        with open(config_path, "w") as f:
-            f.write(data.config)
-        
-        # Validate and reload
-        try:
-            reload_settings()
-        except Exception as e:
-            # Restore backup on validation failure
-            if backup_path.exists():
-                with open(backup_path, "r") as f:
-                    with open(config_path, "w") as f2:
-                        f2.write(f.read())
-            raise HTTPException(status_code=400, detail=f"Invalid configuration: {str(e)}")
-        
+        config = yaml.safe_load(data.config)
+        if not isinstance(config, dict):
+            raise ValueError("Configuration must be a YAML mapping")
+        existing = yaml.safe_load(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+        _mask_config_secrets(config, existing or {})
+        Config.model_validate(config)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=config_path.parent, delete=False,
+        ) as temp:
+            temp_path = Path(temp.name)
+            yaml.safe_dump(config, temp, sort_keys=False)
+        temp_path.replace(config_path)
+        reload_settings()
         return {"message": "Configuration updated successfully and reloaded"}
-    except HTTPException:
-        raise
-    except yaml.YAMLError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid YAML: {str(e)}")
-    except Exception as e:
-        logger.error(f"Failed to update config: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except ValidationError as error:
+        fields = ", ".join(".".join(map(str, item["loc"])) for item in error.errors())
+        raise HTTPException(status_code=400, detail=f"Invalid configuration fields: {fields}")
+    except (ValueError, yaml.YAMLError):
+        raise HTTPException(status_code=400, detail="Invalid configuration YAML or secret placeholder")
+    except OSError:
+        logger.error("Failed to save dashboard configuration")
+        raise HTTPException(status_code=500, detail="Could not save configuration")
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 @app.post("/api/sync/trigger")
-async def trigger_sync():
+async def trigger_sync(preview: bool = False):
     """Trigger an immediate sync"""
     if not acquire_sync_lock():
         raise HTTPException(status_code=409, detail="Sync already in progress")
     
     try:
         settings = get_settings()
+        valid, _ = validate_credentials()
+        if not valid:
+            raise HTTPException(status_code=409, detail="Save both services' client IDs and secrets first")
         mode = _cli_sync_mode if _cli_sync_mode else settings.sync_mode
-        dry_run = _cli_dry_run if _cli_dry_run is not None else settings.dry_run
+        dry_run = preview or bool(_cli_dry_run) or settings.dry_run
+        if dry_run:
+            sync_status["preview"] = None
+        sync_status["last_manual_success"] = None
         
         def run_manual_sync():
             try:
                 logger.info(f"[INFO] Manual sync started (mode: {mode})")
-                update_sync_status(running=True)
                 success, result = execute_sync(mode, dry_run=dry_run, settings=settings)
+                update_sync_status(sync_readiness=sync_readiness(result, success))
+                if result is not None and result.accounts:
+                    update_sync_status(accounts=result.accounts)
+                sync_status["last_manual_success"] = bool(success and result and result.success)
+                if dry_run:
+                    sync_status["preview"] = result
                 
                 if success and result:
                     if result.dry_run:
-                        print_sync_results(result, mode)
                         result_msg = (
                             f"Dry run: {result.planned_changes} planned, "
-                            f"{len(result.skipped_conflicts)} conflicts (Manual)"
+                            f"{len(result.skipped_conflicts)} conflicts, {result.entries_skipped} other skips (Manual)"
                         )
                         logger.info("[INFO] Manual sync completed: %s", result_msg)
                     else:
                         total = result.entries_synced + result.entries_failed
                         if result.success:
-                            result_msg = f"{result.entries_synced}/{total} synced, 0 failed (Manual)"
+                            result_msg = f"{result.entries_synced}/{total} synced, 0 failed"
                             logger.info(f"[INFO] Manual sync completed: {result_msg}")
                         elif result.entries_synced > 0:
-                            result_msg = f"{result.entries_synced}/{total} synced, {result.entries_failed} failed (Manual)"
+                            result_msg = f"{result.entries_synced}/{total} synced, {result.entries_failed} failed"
                             logger.warning(f"[WARNING] Manual sync completed: {result_msg}")
                         else:
-                            result_msg = f"0/{total} synced, {result.entries_failed} failed (Manual)"
+                            result_msg = f"0/{total} synced, {result.entries_failed} failed"
                             logger.error(f"[ERROR] Manual sync failed: {result_msg}")
+                        result_msg += (
+                            f", {len(result.skipped_conflicts)} conflicts, "
+                            f"{result.entries_skipped} other skips (Manual)"
+                        )
                     
                     update_sync_status(
                         last_sync=time.strftime('%Y-%m-%d %H:%M:%S %Z'),
-                        last_result=result_msg
+                        last_result=result_msg,
+                        successful=result.success and not result.dry_run,
                     )
                 else:
                     if result is not None:
-                        print_sync_results(result, mode)
                         result_msg = (
                             f"Failed: {result.entries_synced} writes, "
                             f"{result.entries_failed} errors (Manual)"
@@ -542,6 +693,8 @@ async def trigger_sync():
                         last_result=result_msg
                     )
             except Exception as e:
+                sync_status["last_manual_success"] = False
+                update_sync_status(sync_readiness="Error")
                 logger.error(f"[ERROR] Manual sync failed: {e}")
                 update_sync_status(
                     last_sync=time.strftime('%Y-%m-%d %H:%M:%S %Z'),
@@ -552,19 +705,33 @@ async def trigger_sync():
         
         threading.Thread(target=run_manual_sync, daemon=True).start()
         return {"message": "Sync triggered successfully"}
+    except HTTPException:
+        _sync_lock.release()
+        raise
     except Exception as e:
         _sync_lock.release()
         logger.error(f"Failed to trigger sync: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def update_sync_status(running: bool = None, last_sync: str = None, 
-                       next_sync: str = None, last_result: str = None):
+def update_sync_status(
+    running: bool | None = None, last_sync: str | None = None,
+    next_sync: str | None = None, last_result: str | None = None,
+    successful: bool = False,
+    accounts: dict[str, str] | None = None,
+    sync_readiness: str | None = None,
+):
     """Update the global sync status (called from CLI)"""
     if running is not None:
         sync_status["running"] = running
+    if accounts is not None:
+        sync_status["accounts"] = accounts
+    if sync_readiness is not None:
+        sync_status["sync_readiness"] = sync_readiness
     if last_sync:
         sync_status["last_sync"] = last_sync
+        if successful:
+            sync_status["last_successful_sync"] = last_sync
     if next_sync:
         sync_status["next_sync"] = next_sync
     if last_result:
@@ -572,7 +739,7 @@ def update_sync_status(running: bool = None, last_sync: str = None,
         sync_status["total_syncs"] += 1
 
 
-def set_cli_sync_params(mode: str, dry_run: bool):
+def set_cli_sync_params(mode: str | None, dry_run: bool):
     """Set the sync mode and dry_run from CLI (called when web UI starts)"""
     global _cli_sync_mode, _cli_dry_run
     _cli_sync_mode = mode

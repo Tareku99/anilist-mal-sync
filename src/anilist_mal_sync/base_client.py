@@ -29,6 +29,14 @@ class AuthenticationError(requests.HTTPError):
         )
 
 
+class BoundedRetry(Retry):
+    """Keep a server's Retry-After response from blocking the sync indefinitely."""
+
+    def get_retry_after(self, response):
+        delay = super().get_retry_after(response)
+        return min(delay, 30) if delay is not None else None
+
+
 class BaseAPIClient:
     """Base class for API clients with common request handling."""
 
@@ -39,8 +47,10 @@ class BaseAPIClient:
         self.session = requests.Session()
         
         # Configure retry strategy for rate limits (429)
-        retry_strategy = Retry(
+        retry_strategy = BoundedRetry(
             total=3,
+            read=0,
+            other=0,
             backoff_factor=1,
             status_forcelist=[HTTP_TOO_MANY_REQUESTS],
             allowed_methods=["GET", "POST", "PATCH", "PUT", "DELETE"]

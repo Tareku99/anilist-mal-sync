@@ -6,6 +6,7 @@ from typing import Optional
 from .base_client import AuthenticationError, BaseAPIClient
 from .config import Settings, get_settings
 from .models import AnimeEntry, WatchStatus
+from .watch_dates import DATE_FIELDS, anilist_watch_date, read_watch_dates
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,7 @@ class AniListClient(BaseAPIClient):
         if variables:
             payload["variables"] = variables
 
-        response = self.session.post(self.base_url, json=payload)
+        response = self.session.post(self.base_url, json=payload, timeout=(5, 30))
 
         if response.status_code != HTTP_OK:
             self._handle_auth_error(response, "AniList")
@@ -64,13 +65,26 @@ class AniListClient(BaseAPIClient):
 
     def get_user_anime_list(self, username: Optional[str] = None) -> list[AnimeEntry]:
         """Fetch user's anime list from AniList."""
+        viewer = self._query("query { Viewer { id name } }").get("Viewer")
+        account = viewer.get("name") if viewer else None
+        if not account:
+            raise ValueError("AniList did not return the authenticated user's name")
+        if username and username.casefold() != account.casefold():
+            raise ValueError(f"AniList token belongs to {account}, expected {username}")
+        self.account_key = str(viewer.get("id") or account.casefold())
+        self.account_name = account
+        username = account
+        logger.info("Syncing AniList account %s", username)
+
         query = """
-        query ($userName: String) {
-          MediaListCollection(userName: $userName, type: ANIME) {
+        query ($userName: String!, $chunk: Int!) {
+          MediaListCollection(userName: $userName, type: ANIME, chunk: $chunk) {
+            hasNextChunk
             lists {
               entries {
                 id
                 status
+                private
                 score(format: POINT_10_DECIMAL)
                 progress
                 progressVolumes
@@ -92,18 +106,47 @@ class AniListClient(BaseAPIClient):
         }
         """
 
-        # If no username provided, get current authenticated user
-        variables = {"userName": username} if username else None
-
-        data = self._query(query, variables)
         entries = []
-
-        for list_group in data.get("MediaListCollection", {}).get("lists", []):
-            for entry in list_group.get("entries", []):
-                entries.append(self._parse_entry(entry))
+        seen_entry_ids = set()
+        chunk = 1
+        while True:
+            data = self._query(query, {"userName": username, "chunk": chunk})
+            collection = data.get("MediaListCollection")
+            if (
+                not isinstance(collection, dict)
+                or not isinstance(collection.get("lists"), list)
+                or not isinstance(collection.get("hasNextChunk"), bool)
+            ):
+                raise ValueError(f"AniList returned an incomplete anime list chunk ({chunk})")
+            for list_group in collection["lists"]:
+                if not isinstance(list_group, dict) or not isinstance(list_group.get("entries"), list):
+                    raise ValueError(f"AniList returned an incomplete list group in chunk {chunk}")
+                for entry in list_group["entries"]:
+                    entry_id = entry["id"]
+                    if entry_id not in seen_entry_ids:
+                        entries.append(self._parse_entry(entry))
+                        seen_entry_ids.add(entry_id)
+            if not collection.get("hasNextChunk"):
+                break
+            chunk += 1
 
         logger.info(f"Fetched {len(entries)} anime entries from AniList")
         return entries
+
+    def find_anime_by_mal_id(self, mal_id: int) -> list[dict]:
+        """Fetch up to two exact matches so the caller can detect duplicate IDs."""
+        query = """
+        query ($malId: Int!) {
+          Page(perPage: 2) {
+            media(idMal: $malId, type: ANIME) {
+              id
+              idMal
+            }
+          }
+        }
+        """
+        data = self._query(query, {"malId": mal_id})
+        return data["Page"]["media"]
 
     def search_anime(self, title: str, limit: int = 5) -> list[dict]:
         """Search AniList anime by title to find IDs."""
@@ -132,6 +175,7 @@ class AniListClient(BaseAPIClient):
         # Map AniList status to common status
         status_map = {
             "CURRENT": WatchStatus.WATCHING,
+            "REPEATING": WatchStatus.COMPLETED,
             "COMPLETED": WatchStatus.COMPLETED,
             "PAUSED": WatchStatus.ON_HOLD,
             "DROPPED": WatchStatus.DROPPED,
@@ -144,21 +188,28 @@ class AniListClient(BaseAPIClient):
             from datetime import datetime, timezone
             updated_at = datetime.fromtimestamp(entry["updatedAt"], tz=timezone.utc)
 
+        dates, unavailable_dates = read_watch_dates(
+            entry, ("startedAt", "completedAt"), keys_required=True,
+        )
         return AnimeEntry(
             anilist_id=media.get("id"),
             mal_id=media.get("idMal"),
             title=title,
-            status=status_map.get(entry.get("status"), WatchStatus.WATCHING),
+            status=status_map.get(entry.get("status"), WatchStatus.UNKNOWN),
+            is_rewatching=entry.get("status") == "REPEATING",
             score=entry.get("score"),
             episodes_watched=entry.get("progress", 0),
             total_episodes=media.get("episodes"),
             notes=entry.get("notes"),
             rewatched=entry.get("repeat", 0),
             is_favorite=media.get("isFavourite", False),
+            is_private=entry.get("private") if isinstance(entry.get("private"), bool) else None,
+            unavailable_dates=unavailable_dates,
             updated_at=updated_at,
+            **dates,
         )
 
-    def update_anime(self, entry: AnimeEntry) -> bool:
+    def update_anime(self, entry: AnimeEntry, *, fields: list[str] | None = None) -> bool:
         """Update an anime entry on AniList."""
         if not entry.anilist_id:
             logger.warning(f"Cannot update AniList entry without anilist_id: {self._safe_title(entry.title)}")
@@ -173,35 +224,51 @@ class AniListClient(BaseAPIClient):
             WatchStatus.PLAN_TO_WATCH: "PLANNING",
         }
 
-        variables = {
-            "mediaId": entry.anilist_id,
-            "status": status_map.get(entry.status),
-            "progress": entry.episodes_watched,
-            "repeat": entry.rewatched,
-            "notes": entry.notes,
+        candidates = {
+            "status": (
+                "status", "MediaListStatus",
+                "REPEATING" if entry.is_rewatching else status_map.get(entry.status),
+            ),
+            "episodes_watched": ("progress", "Int", entry.episodes_watched),
+            "rewatched": ("repeat", "Int", entry.rewatched),
+            "notes": ("notes", "String", entry.notes or ""),
         }
-        score_argument = ""
-        score_variable = ""
+        for field, name in zip(DATE_FIELDS, ("startedAt", "completedAt")):
+            value = getattr(entry, field)
+            if field not in entry.unavailable_dates and (value or (fields and field in fields)):
+                candidates[field] = (name, "FuzzyDateInput", anilist_watch_date(value))
         if self.settings.score_sync_mode == "auto":
-            score_argument = ", scoreRaw: $scoreRaw"
-            score_variable = ", $scoreRaw: Int"
             normalized_score = entry.score
             if normalized_score is not None and normalized_score <= 10:
                 normalized_score *= 10
-            variables["scoreRaw"] = (
-                int(round(normalized_score)) if normalized_score is not None else 0
+            candidates["score"] = (
+                "scoreRaw", "Int",
+                int(round(normalized_score)) if normalized_score is not None else 0,
             )
+        variables = {"mediaId": entry.anilist_id}
+        declarations = ["$mediaId: Int"]
+        arguments = ["mediaId: $mediaId"]
+        if fields is not None and "is_rewatching" in fields and "status" not in fields:
+            fields = [*fields, "status"]
+        for field, (name, graphql_type, value) in candidates.items():
+            if fields is None or field in fields:
+                variables[name] = value
+                declarations.append(f"${name}: {graphql_type}")
+                arguments.append(f"{name}: ${name}")
 
         mutation = f"""
-        mutation ($mediaId: Int, $status: MediaListStatus{score_variable}, $progress: Int, $repeat: Int, $notes: String) {{
-          SaveMediaListEntry(mediaId: $mediaId, status: $status{score_argument}, progress: $progress, repeat: $repeat, notes: $notes) {{
+        mutation ({', '.join(declarations)}) {{
+          SaveMediaListEntry({', '.join(arguments)}) {{
             id
           }}
         }}
         """
 
         try:
-            self._query(mutation, variables)
+            saved = self._query(mutation, variables).get("SaveMediaListEntry")
+            if not isinstance(saved, dict) or not saved.get("id"):
+                logger.error("AniList did not confirm the update for media ID %s", entry.anilist_id)
+                return False
             logger.info(f"Updated AniList entry: {self._safe_title(entry.title)} (episodes: {entry.episodes_watched})")
             return True
         except AuthenticationError:

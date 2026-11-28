@@ -3,11 +3,15 @@
 import logging
 from collections import defaultdict
 from datetime import datetime, timezone
+from hashlib import sha256
+from pathlib import Path
 from typing import Literal
 
 from .base_client import AuthenticationError
 from .config import Settings, get_settings
-from .models import AnimeEntry, SyncChange, SyncResult
+from .models import AnimeEntry, SyncChange, SyncResult, WatchStatus
+from .sync_history import SyncHistory
+from .watch_dates import DATE_FIELDS, date_order_is_possible
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +21,8 @@ Platform = Literal["anilist", "mal"]
 class SyncEngine:
     """Plan and apply deterministic changes between AniList and MAL."""
 
-    SYNC_FIELDS = ("status", "episodes_watched", "rewatched", "notes", "score")
+    SYNC_FIELDS = ("status", "is_rewatching", "episodes_watched", "rewatched", "notes", "score", *DATE_FIELDS)
+    REWATCH_FIELDS = frozenset(("status", "is_rewatching", "episodes_watched", "rewatched"))
 
     def __init__(
         self,
@@ -25,12 +30,16 @@ class SyncEngine:
         mal_client,
         dry_run: bool = False,
         settings: Settings | None = None,
+        history_directory: Path | None = None,
+        mal_ids: frozenset[int] = frozenset(),
     ):
         """Initialize the engine with API clients and an optional settings snapshot."""
         self.anilist = anilist_client
         self.mal = mal_client
         self.dry_run = dry_run
         self.settings = settings or get_settings()
+        self.history_directory = history_directory
+        self.mal_ids = mal_ids
 
     @staticmethod
     def _safe_title(title: str) -> str:
@@ -38,10 +47,10 @@ class SyncEngine:
         return (title or "").encode("ascii", "replace").decode("ascii")
 
     @staticmethod
-    def _normalize_score_for_mal(score: float | None) -> int | None:
+    def _normalize_score_for_mal(score: float | None) -> int:
         """Normalize AniList's 0-100 and MAL's 0-10 scales for comparison."""
         if score is None:
-            return None
+            return 0
         if score > 10:
             score /= 10.0
         return int(round(score))
@@ -74,7 +83,7 @@ class SyncEngine:
         cls, entries: list[AnimeEntry]
     ) -> dict[int, list[AnimeEntry]]:
         grouped: dict[int, list[AnimeEntry]] = defaultdict(list)
-        for entry in entries:
+        for entry in cls._ordered_entries(entries):
             if entry.mal_id is not None:
                 grouped[entry.mal_id].append(entry)
         return dict(grouped)
@@ -95,6 +104,8 @@ class SyncEngine:
         changed = []
         if source_entry.status != target_entry.status:
             changed.append("status")
+        if source_entry.is_rewatching != target_entry.is_rewatching:
+            changed.append("is_rewatching")
         if source_entry.episodes_watched != target_entry.episodes_watched:
             changed.append("episodes_watched")
         if source_entry.rewatched != target_entry.rewatched:
@@ -106,6 +117,10 @@ class SyncEngine:
                 target_entry.score
             ):
                 changed.append("score")
+        for field in DATE_FIELDS:
+            source_date = getattr(source_entry, field)
+            if source_date is not None and source_date != getattr(target_entry, field):
+                changed.append(field)
         return changed
 
     def _entry_values(self, entry: AnimeEntry) -> dict[str, object]:
@@ -143,6 +158,8 @@ class SyncEngine:
         if differences is None and fields:
             source_values = self._entry_values(entry)
             target_values = self._entry_values(target_entry) if target_entry else {}
+            if target == "mal" and "score" in fields:
+                source_values["score"] = self._normalize_score_for_mal(entry.score)
             differences = {
                 field: {
                     "from": target_values.get(field),
@@ -175,6 +192,10 @@ class SyncEngine:
         winner: str | None = None,
     ) -> None:
         operation = "skipped_conflict" if conflict else "skipped"
+        if conflict:
+            logger.warning("Skipping %s: %s", self._safe_title(entry.title), reason)
+        elif reason != "already in sync":
+            logger.info("Skipping %s: %s", self._safe_title(entry.title), reason)
         self._record(
             result,
             self._make_change(
@@ -187,6 +208,24 @@ class SyncEngine:
             ),
         )
 
+    def _skip_blocked_entry(
+        self, result: SyncResult, entry: AnimeEntry, other: AnimeEntry | None
+    ) -> bool:
+        entries = (entry,) if other is None else (entry, other)
+        if any(item.is_private is True for item in entries):
+            self._skip(result, entry, "private AniList entry", conflict=True)
+            return True
+        if any(item.is_private is None for item in entries):
+            self._skip(result, entry, "AniList entry visibility unavailable", conflict=True)
+            return True
+        if any(item.status == WatchStatus.UNKNOWN for item in entries):
+            self._skip(result, entry, "unrecognized watch status", conflict=True)
+            return True
+        if any(item.is_rewatching and item.status != WatchStatus.COMPLETED for item in entries):
+            self._skip(result, entry, "active rewatch has an unsupported base status", conflict=True)
+            return True
+        return False
+
     def _apply(
         self,
         result: SyncResult,
@@ -195,13 +234,66 @@ class SyncEngine:
         source: Platform,
         target: Platform,
         target_client,
+        fields: list[str] | None = None,
     ) -> None:
+        if self._skip_blocked_entry(result, source_entry, target_entry):
+            return
         operation = "addition" if target_entry is None else "update"
-        fields = list(self.SYNC_FIELDS) if target_entry is None else self._changed_fields(
-            source_entry, target_entry
-        )
+        if fields is None:
+            if target_entry is None:
+                fields = [
+                    field for field in self.SYNC_FIELDS
+                    if field not in DATE_FIELDS or getattr(source_entry, field) is not None
+                ]
+            else:
+                fields = self._changed_fields(source_entry, target_entry)
+            unavailable = source_entry.unavailable_dates | (
+                target_entry.unavailable_dates if target_entry else set()
+            )
+            if unavailable:
+                self._skip(
+                    result, source_entry, "watch date is unavailable or cannot be represented on both services",
+                    conflict=True, fields=[field for field in DATE_FIELDS if field in unavailable],
+                )
+                fields = [field for field in fields if field not in unavailable]
+                if not fields:
+                    return
         if self.settings.score_sync_mode != "auto":
             fields = [field for field in fields if field != "score"]
+        dates_to_write = [field for field in DATE_FIELDS if field in fields]
+        if dates_to_write:
+            start, finish = (
+                getattr(source_entry, field) if field in fields else getattr(target_entry, field, None)
+                for field in DATE_FIELDS
+            )
+            if start and finish and not date_order_is_possible(start, finish):
+                self._skip(
+                    result, source_entry, "watch dates would put the start after the finish",
+                    conflict=True, fields=dates_to_write,
+                )
+                fields = [field for field in fields if field not in dates_to_write]
+                if not fields:
+                    return
+        if (
+            target == "anilist" and target_entry is not None
+            and target_entry.is_rewatching and not source_entry.is_rewatching
+            and "is_rewatching" in fields and source_entry.status == WatchStatus.COMPLETED
+            and source_entry.rewatched <= target_entry.rewatched
+        ):
+            self._skip(
+                result, source_entry,
+                "MAL ended a rewatch without an increased count; AniList would increment it",
+                conflict=True, fields=fields,
+                differences=self._conflict_differences(target_entry, source_entry, fields),
+            )
+            return
+        if target_entry is not None and "is_rewatching" in fields:
+            # AniList represents rewatching in its status. Always send the verified
+            # count on a transition so an automatic increment cannot double-count.
+            fields = [
+                field for field in self.SYNC_FIELDS
+                if field in fields or field in ("status", "rewatched")
+            ]
         if target_entry is not None and not fields:
             self._skip(result, source_entry, "already in sync")
             return
@@ -225,7 +317,7 @@ class SyncEngine:
             return
 
         try:
-            if target_client.update_anime(source_entry):
+            if target_client.update_anime(source_entry, fields=fields):
                 result.entries_synced += 1
             else:
                 result.entries_failed += 1
@@ -274,15 +366,19 @@ class SyncEngine:
             target_entries = self.anilist.get_user_anime_list(username)
             target_client = self.anilist
 
+        result.accounts = self._verified_accounts()
         source_groups = self._group_by_mal_id(source_entries)
         target_groups = self._group_by_mal_id(target_entries)
         by_anilist_id: dict[int, list[AnimeEntry]] = defaultdict(list)
         for entry in target_entries:
             if entry.anilist_id is not None:
                 by_anilist_id[entry.anilist_id].append(entry)
+        reserved_anilist_ids = set(by_anilist_id)
 
         for source_entry in self._ordered_entries(source_entries):
             mal_id = source_entry.mal_id
+            if self.mal_ids and mal_id not in self.mal_ids:
+                continue
             if mal_id is None:
                 self._skip(result, source_entry, "missing MAL ID; cannot match across services")
                 continue
@@ -351,6 +447,10 @@ class SyncEngine:
                             conflict=ambiguous,
                         )
                         continue
+                    if not self._reserve_anilist_match(
+                        result, source_entry, anilist_id, reserved_anilist_ids
+                    ):
+                        continue
                     prepared_entry = source_entry.model_copy(update={"anilist_id": anilist_id})
 
             self._apply(
@@ -366,27 +466,24 @@ class SyncEngine:
         return result
 
     def _find_anilist_id(
-        self, title: str, mal_id: int | None = None
+        self, title: str, mal_id: int
     ) -> tuple[int | None, str, bool]:
-        """Prefer an exact MAL ID, then use a unique exact title without ID conflicts."""
-        matches = self.anilist.search_anime(title, limit=10)
-        candidates = [match for match in matches if match.get("id") is not None]
+        """Look up the MAL ID directly; use title search for suggestions only."""
+        matches = self.anilist.find_anime_by_mal_id(mal_id)
+        if any(match.get("idMal") != mal_id or not match.get("id") for match in matches):
+            return None, f"AniList returned inconsistent data for MAL ID {mal_id}", True
+        mal_matches = {match["id"] for match in matches}
+        if len(mal_matches) == 1:
+            return mal_matches.pop(), "", False
+        if len(mal_matches) > 1:
+            return None, f"multiple AniList results match MAL ID {mal_id}", True
 
-        if mal_id is not None:
-            mal_matches = {
-                match["id"] for match in candidates if match.get("idMal") == mal_id
-            }
-            if len(mal_matches) == 1:
-                return mal_matches.pop(), "", False
-            if len(mal_matches) > 1:
-                return None, f"multiple AniList results match MAL ID {mal_id}", True
-            candidates = [
-                match for match in candidates if match.get("idMal") in (None, mal_id)
-            ]
-
+        candidates = self.anilist.search_anime(title, limit=10)
         exact_ids = set()
         normalized_title = title.casefold().strip()
         for match in candidates:
+            if not match.get("id") or match.get("idMal") not in (None, mal_id):
+                continue
             titles = match.get("title") or {}
             if any(
                 candidate and candidate.casefold().strip() == normalized_title
@@ -394,10 +491,25 @@ class SyncEngine:
             ):
                 exact_ids.add(match["id"])
         if len(exact_ids) == 1:
-            return exact_ids.pop(), "", False
+            return None, f"title matches AniList ID {exact_ids.pop()} without a verified MAL ID", True
         if len(exact_ids) > 1:
             return None, "multiple exact AniList title matches", True
-        return None, "no exact AniList title match", False
+        return None, f"no AniList entry for MAL ID {mal_id} or exact title suggestion", False
+
+    def _reserve_anilist_match(
+        self, result: SyncResult, entry: AnimeEntry, anilist_id: int, reserved_ids: set[int]
+    ) -> bool:
+        """Protect existing entries and earlier matches from a search-based addition."""
+        if anilist_id in reserved_ids:
+            self._skip(
+                result,
+                entry.model_copy(update={"anilist_id": anilist_id}),
+                f"AniList ID {anilist_id} already exists on the list or was matched in this run",
+                conflict=True,
+            )
+            return False
+        reserved_ids.add(anilist_id)
+        return True
 
     def _sync_bidirectional(self) -> SyncResult:
         """Sync both ways using conservative, deterministic conflict rules."""
@@ -405,18 +517,26 @@ class SyncEngine:
         username = self.settings.anilist_username or None
         anilist_entries = self.anilist.get_user_anime_list(username)
         mal_entries = self.mal.get_user_anime_list()
+        result.accounts = self._verified_accounts()
+        history = self._load_history()
         anilist_groups = self._group_by_mal_id(anilist_entries)
         mal_groups = self._group_by_mal_id(mal_entries)
+        reserved_anilist_ids = {
+            entry.anilist_id for entry in anilist_entries if entry.anilist_id is not None
+        }
 
         for entry in self._ordered_entries(anilist_entries):
-            if entry.mal_id is None:
+            if entry.mal_id is None and not self.mal_ids:
                 self._skip(result, entry, "missing MAL ID; cannot match across services")
 
         for entry in self._ordered_entries(mal_entries):
-            if entry.mal_id is None:
+            if entry.mal_id is None and not self.mal_ids:
                 self._skip(result, entry, "missing MAL ID; cannot match across services")
 
-        for mal_id in sorted(set(anilist_groups) | set(mal_groups)):
+        all_ids = set(anilist_groups) | set(mal_groups)
+        if self.mal_ids:
+            all_ids.intersection_update(self.mal_ids)
+        for mal_id in sorted(all_ids):
             anilist_matches = anilist_groups.get(mal_id, [])
             mal_matches = mal_groups.get(mal_id, [])
             if len(anilist_matches) > 1 or len(mal_matches) > 1:
@@ -431,6 +551,19 @@ class SyncEngine:
 
             anilist_entry = anilist_matches[0] if anilist_matches else None
             mal_entry = mal_matches[0] if mal_matches else None
+            previous = history.values(mal_id) if history is not None else None
+            if anilist_entry is not None and anilist_entry.is_private is not False:
+                if history is not None:
+                    history.clear_values(mal_id)
+                self._skip_blocked_entry(result, anilist_entry, mal_entry)
+                continue
+            if previous is not None and (anilist_entry is None or mal_entry is None):
+                self._skip(
+                    result, anilist_entry or mal_entry,
+                    "entry disappeared from one list after being seen on both",
+                    conflict=True,
+                )
+                continue
             if anilist_entry is not None and mal_entry is None:
                 self._apply(
                     result,
@@ -454,6 +587,10 @@ class SyncEngine:
                 if anilist_id is None:
                     self._skip(result, mal_entry, reason, conflict=ambiguous)
                     continue
+                if not self._reserve_anilist_match(
+                    result, mal_entry, anilist_id, reserved_anilist_ids
+                ):
+                    continue
                 prepared_entry = mal_entry.model_copy(update={"anilist_id": anilist_id})
                 self._apply(
                     result,
@@ -464,10 +601,131 @@ class SyncEngine:
                     self.anilist,
                 )
             elif anilist_entry is not None and mal_entry is not None:
-                self._resolve_conflict(result, anilist_entry, mal_entry)
+                if history is None:
+                    self._resolve_conflict(result, anilist_entry, mal_entry)
+                else:
+                    self._resolve_from_history(result, anilist_entry, mal_entry, history, mal_id)
 
+        if history is not None and not self.dry_run:
+            history.save()
         result.success = result.entries_failed == 0
         return result
+
+    def _verified_accounts(self) -> dict[str, str]:
+        accounts = {}
+        for name, client in (("anilist", self.anilist), ("mal", self.mal)):
+            username = getattr(client, "account_name", None)
+            if isinstance(username, str):
+                accounts[name] = username
+        return accounts
+
+    def _load_history(self) -> SyncHistory | None:
+        if self.history_directory is None:
+            return None
+        accounts = (getattr(self.anilist, "account_key", None), getattr(self.mal, "account_key", None))
+        if not all(isinstance(account, str) for account in accounts):
+            return None
+        pair = sha256(repr(accounts).encode()).hexdigest()
+        return SyncHistory(self.history_directory / f"sync-history-{pair}.json", accounts)
+
+    def _history_values(self, entry: AnimeEntry) -> dict[str, object]:
+        values = self._entry_values(entry)
+        values["notes"] = entry.notes or ""
+        if "score" in values:
+            values["score"] = self._normalize_score_for_mal(entry.score)
+        return values
+
+    def _plan_watch_dates(
+        self, result: SyncResult, anilist: AnimeEntry, mal: AnimeEntry,
+        previous: dict[str, object],
+    ) -> tuple[list[str], list[str], dict[str, object], bool]:
+        to_mal, to_anilist, conflicts, unavailable = [], [], [], []
+        agreed = {}
+        for field in DATE_FIELDS:
+            if field in anilist.unavailable_dates or field in mal.unavailable_dates:
+                unavailable.append(field)
+                continue
+            left, right = getattr(anilist, field), getattr(mal, field)
+            if left == right:
+                agreed[field] = left
+            elif field in previous:
+                if right == previous[field]:
+                    to_mal.append(field)
+                elif left == previous[field]:
+                    to_anilist.append(field)
+                else:
+                    conflicts.append(field)
+            elif right is None or (left and left.startswith(right + "-")):
+                to_mal.append(field)
+            elif left is None or right.startswith(left + "-"):
+                to_anilist.append(field)
+            else:
+                conflicts.append(field)
+        for fields, reason in (
+            (conflicts, "watch dates disagree without a clear change from the last agreement"),
+            (unavailable, "watch date is unavailable or cannot be represented on both services"),
+        ):
+            if fields:
+                self._skip(
+                    result, anilist, reason, conflict=True, fields=fields,
+                    differences=self._conflict_differences(anilist, mal, fields),
+                )
+        return to_mal, to_anilist, agreed, bool(conflicts or unavailable)
+
+    def _resolve_from_history(
+        self, result: SyncResult, anilist: AnimeEntry, mal: AnimeEntry,
+        history: SyncHistory, mal_id: int,
+    ) -> None:
+        if self._skip_blocked_entry(result, anilist, mal):
+            history.remember(mal_id, {})
+            return
+        previous = history.values(mal_id) or {}
+        al_values = self._history_values(anilist)
+        mal_values = self._history_values(mal)
+        to_mal, to_anilist, agreed, date_conflict = self._plan_watch_dates(
+            result, anilist, mal, previous
+        )
+        conflicts = []
+        for field, al_value in al_values.items():
+            if field in DATE_FIELDS:
+                continue
+            mal_value = mal_values[field]
+            if al_value == mal_value:
+                agreed[field] = al_value
+            elif field not in previous:
+                conflicts.append(field)
+            elif mal_value == previous[field]:
+                to_mal.append(field)
+            elif al_value == previous[field]:
+                to_anilist.append(field)
+            else:
+                conflicts.append(field)
+        if anilist.is_rewatching != mal.is_rewatching:
+            changing = self.REWATCH_FIELDS.intersection(al_values)
+            if (
+                changing.intersection(conflicts)
+                or (changing.intersection(to_mal) and changing.intersection(to_anilist))
+            ):
+                conflicts = [
+                    field for field in self.SYNC_FIELDS
+                    if field in conflicts or (field in changing and al_values[field] != mal_values[field])
+                ]
+                to_mal = [field for field in to_mal if field not in changing]
+                to_anilist = [field for field in to_anilist if field not in changing]
+        history.remember(mal_id, agreed)
+        if conflicts:
+            self._skip(
+                result, anilist, "values disagree without a clear change from the last agreement",
+                conflict=True, fields=conflicts,
+                differences=self._conflict_differences(anilist, mal, conflicts),
+            )
+        if to_mal:
+            self._apply(result, anilist, mal, "anilist", "mal", self.mal, fields=to_mal)
+        if to_anilist:
+            prepared = mal.model_copy(update={"anilist_id": anilist.anilist_id})
+            self._apply(result, prepared, anilist, "mal", "anilist", self.anilist, fields=to_anilist)
+        if not (conflicts or date_conflict or to_mal or to_anilist):
+            self._skip(result, anilist, "already in sync")
 
     def _conflict_differences(
         self,
@@ -490,9 +748,22 @@ class SyncEngine:
         mal_entry: AnimeEntry,
     ) -> None:
         """Apply a clear winner or report a conflict rather than silently discarding it."""
-        fields = self._changed_fields(anilist_entry, mal_entry)
+        if self._skip_blocked_entry(result, anilist_entry, mal_entry):
+            return
+        to_mal, to_anilist, _, date_conflict = self._plan_watch_dates(
+            result, anilist_entry, mal_entry, {}
+        )
+        if to_mal:
+            self._apply(result, anilist_entry, mal_entry, "anilist", "mal", self.mal, fields=to_mal)
+        if to_anilist:
+            prepared = mal_entry.model_copy(update={"anilist_id": anilist_entry.anilist_id})
+            self._apply(result, prepared, anilist_entry, "mal", "anilist", self.anilist, fields=to_anilist)
+        fields = [
+            field for field in self._changed_fields(anilist_entry, mal_entry) if field not in DATE_FIELDS
+        ]
         if not fields:
-            self._skip(result, anilist_entry, "already in sync")
+            if not (to_mal or to_anilist or date_conflict):
+                self._skip(result, anilist_entry, "already in sync")
             return
 
         anilist_time = self._timestamp(anilist_entry.updated_at)
@@ -506,6 +777,7 @@ class SyncEngine:
                     "anilist",
                     "mal",
                     self.mal,
+                    fields=fields,
                 )
             else:
                 prepared_mal = mal_entry.model_copy(
@@ -518,6 +790,7 @@ class SyncEngine:
                     "mal",
                     "anilist",
                     self.anilist,
+                    fields=fields,
                 )
             return
 
@@ -536,6 +809,7 @@ class SyncEngine:
                     "anilist",
                     "mal",
                     self.mal,
+                    fields=fields,
                 )
             else:
                 prepared_mal = mal_entry.model_copy(
@@ -548,6 +822,7 @@ class SyncEngine:
                     "mal",
                     "anilist",
                     self.anilist,
+                    fields=fields,
                 )
             return
 
@@ -556,13 +831,11 @@ class SyncEngine:
             if anilist_time is not None and mal_time is not None
             else "different values cannot be ordered because an update timestamp is missing"
         )
-        self._record(
+        self._skip(
             result,
-            self._make_change(
-                "skipped_conflict",
-                anilist_entry,
-                fields=fields,
-                differences=self._conflict_differences(anilist_entry, mal_entry, fields),
-                reason=reason,
-            ),
+            anilist_entry,
+            reason,
+            conflict=True,
+            fields=fields,
+            differences=self._conflict_differences(anilist_entry, mal_entry, fields),
         )

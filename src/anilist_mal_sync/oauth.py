@@ -5,6 +5,7 @@ import logging
 import secrets
 import tempfile
 import webbrowser
+from time import monotonic
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -168,8 +169,7 @@ class TokenManager:
 class OAuthCallbackHandler(BaseHTTPRequestHandler):
     """HTTP handler for OAuth callback."""
 
-    auth_code = None
-    state = None
+    timeout = 5
 
     def do_GET(self):
         """Handle GET request from OAuth callback."""
@@ -177,9 +177,14 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
         params = parse_qs(parsed.query)
 
         if parsed.path == "/callback":
-            # Extract authorization code and state
-            OAuthCallbackHandler.auth_code = params.get("code", [None])[0]
-            OAuthCallbackHandler.state = params.get("state", [None])[0]
+            if params.get("state", [None])[0] != self.server.expected_state:
+                self.send_error(400, "Invalid OAuth state")
+                return
+            self.server.callback_received = True
+            self.server.auth_code = params.get("code", [None])[0]
+            if not self.server.auth_code:
+                self.send_error(400, "Authorization was cancelled or no code was received")
+                return
 
             # Send response to browser
             self.send_response(HTTP_OK)
@@ -236,7 +241,7 @@ class AniListOAuth:
             "code": code,
         }
 
-        response = requests.post(self.settings.anilist_token_url, json=data)
+        response = requests.post(self.settings.anilist_token_url, json=data, timeout=(5, 30))
         response.raise_for_status()
         
         return response.json()
@@ -295,11 +300,11 @@ class MALOAuth:
             self.settings.mal_token_url,
             data=data,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=(5, 30),
         )
         
         if response.status_code != 200:
             logger.error(f"Token exchange failed: {response.status_code}")
-            logger.error(f"Response: {response.text}")
         
         response.raise_for_status()
         
@@ -320,11 +325,11 @@ class MALOAuth:
                 "Content-Type": "application/x-www-form-urlencoded",
             },
             auth=(self.settings.mal_client_id, self.settings.mal_client_secret),
+            timeout=(5, 30),
         )
         
         if response.status_code != 200:
             logger.error(f"Token refresh failed: {response.status_code}")
-            logger.error(f"Response: {response.text}")
         
         response.raise_for_status()
         logger.info("MAL access token refreshed successfully")
@@ -356,8 +361,6 @@ def refresh_mal_token(service: str, settings: Settings, token_manager: TokenMana
 def run_oauth_flow(service: str, settings: Settings, token_manager: TokenManager) -> bool:
     """Run OAuth flow for a service."""
     logger.info(f"Starting OAuth flow for {service}...")
-    OAuthCallbackHandler.auth_code = None
-    OAuthCallbackHandler.state = None
 
     # Initialize OAuth handler
     if service == "anilist":
@@ -368,38 +371,37 @@ def run_oauth_flow(service: str, settings: Settings, token_manager: TokenManager
         oauth = MALOAuth(settings)
         auth_url, expected_state, code_verifier = oauth.get_authorization_url()
 
-    # Open browser for user authorization
-    print(f"\n[INFO] Opening browser for {service.upper()} authorization...")
-    print(f"If the browser doesn't open, visit this URL:\n{auth_url}\n")
-    webbrowser.open(auth_url)
+    with HTTPServer(("", settings.oauth_port), OAuthCallbackHandler) as server:
+        server.expected_state = expected_state
+        server.callback_received = False
+        server.auth_code = None
+        deadline = monotonic() + 180
+        print(f"\n[INFO] Opening browser for {service.upper()} authorization...")
+        print(f"If the browser doesn't open, visit this URL:\n{auth_url}\n")
+        webbrowser.open(auth_url)
+        while not server.callback_received:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                logger.error("%s authorization timed out", service)
+                return False
+            server.timeout = remaining
+            server.handle_request()
+        code = server.auth_code
 
-    # Start local HTTP server to receive callback
-    server = HTTPServer(("", settings.oauth_port), OAuthCallbackHandler)
-    print(f"[INFO] Waiting for authorization callback on port {settings.oauth_port}...")
-    
-    # Handle one request (the callback)
-    server.handle_request()
-    server.server_close()
-
-    # Verify state and get code
-    if OAuthCallbackHandler.state != expected_state:
-        logger.error("State mismatch! Possible CSRF attack.")
-        return False
-
-    if not OAuthCallbackHandler.auth_code:
-        logger.error("No authorization code received.")
+    if not code:
+        logger.error("%s authorization did not return a code", service)
         return False
 
     # Exchange code for token
     try:
         if service == "anilist":
-            token_data = oauth.exchange_code_for_token(OAuthCallbackHandler.auth_code)
+            token_data = oauth.exchange_code_for_token(code)
             access_token = token_data.get("access_token")
             refresh_token = None
             expires_in = token_data.get("expires_in")  # AniList returns this in response
         else:  # mal
             token_data = oauth.exchange_code_for_token(
-                OAuthCallbackHandler.auth_code, code_verifier
+                code, code_verifier
             )
             access_token = token_data.get("access_token")
             refresh_token = token_data.get("refresh_token")

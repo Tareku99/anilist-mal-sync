@@ -1,4 +1,4 @@
-# AniList ⇄ MyAnimeList Sync
+# AniList–MAL Sync
 
 [![Docker](https://img.shields.io/badge/docker-ghcr.io-blue)](https://github.com/Tareku99/anilist-mal-sync/pkgs/container/anilist-mal-sync)
 
@@ -11,7 +11,7 @@ This is a clean-room rewrite in Python with a fresh codebase and architecture.
 
 ## Features
 
-- **Bidirectional sync** with deterministic conflict handling (newer update wins; ambiguous conflicts are reported and skipped)
+- **Bidirectional sync** with field-level conflict handling and review for ambiguous changes
 - **One-way sync modes**: AniList → MAL or MAL → AniList
 - **OAuth authentication** for both services
 - **Docker deployment** with auto-configuration
@@ -80,14 +80,14 @@ oauth:
 anilist:
   client_id: "your_anilist_client_id"                        # REQUIRED
   client_secret: "your_anilist_client_secret"                # REQUIRED
-  username: "your_anilist_username"                          # REQUIRED
+  # username: "your_anilist_username"                        # OPTIONAL account check
   # auth_url: "https://anilist.co/api/v2/oauth/authorize"    # OPTIONAL - has defaults
   # token_url: "https://anilist.co/api/v2/oauth/token"       # OPTIONAL - has defaults
 
 myanimelist:
   client_id: "your_mal_client_id"                            # REQUIRED
   client_secret: "your_mal_client_secret"                    # REQUIRED
-  username: "your_mal_username"                              # REQUIRED
+  # username: "your_mal_username"                            # OPTIONAL account check
   # auth_url: "https://myanimelist.net/v1/oauth2/authorize"  # OPTIONAL - has defaults
   # token_url: "https://myanimelist.net/v1/oauth2/token"     # OPTIONAL - has defaults
 
@@ -105,6 +105,8 @@ Run `docker compose restart` so the container reads the new credentials. On Unra
 ### 4. Authenticate
 
 Check container logs for OAuth URLs, open them in your browser to authorize, and the service will start syncing automatically.
+
+Docker reports whether the dashboard is reachable. **Sync Readiness** on the dashboard reports whether the latest sync attempt could use your configuration and authorized accounts. A fresh container can serve the dashboard while it waits for configuration or OAuth.
 
 ### 5. Access Web UI
 
@@ -222,7 +224,23 @@ sync:
 
 `run --once --dry-run` fetches both lists, plans the same additions and updates as a normal sync, and prints a JSON summary with `additions`, `updates`, `skipped_conflicts`, and `skipped`. Each change includes its direction, IDs, affected fields, and before/after values. The plan is sorted by MAL ID so repeated runs over unchanged lists produce stable output. Dry-run never calls list-update endpoints; OAuth may still refresh or request tokens so the lists can be read.
 
-In bidirectional mode, a strictly newer update timestamp wins. If timestamps are equal or either timestamp is missing, differing statuses are reported as conflicts and skipped. When timestamps are unavailable, only a higher episode count with the same status and no other differing fields is merged automatically.
+For a one-time check of a specific title, use `run --once --dry-run --mal-id 123`. Repeat `--mal-id` to include more titles. After inspecting the preview, omit `--dry-run` to apply changes only to those same IDs, provided dry-run is also disabled in the config.
+
+Bidirectional sync records agreed values for each pair of accounts in the token directory. A field changed on one side since the last agreement can sync independently of other fields. Conflicting changes and first-run disagreements are reported for review. If an entry previously seen on both lists disappears from one list, sync reports it and skips re-adding it. Dry runs leave this history untouched.
+
+Both lists are read from the accounts that own the access tokens. If you configure usernames, they must match those accounts. AniList `REPEATING` maps to MAL `completed` with the active rewatch flag set. Progress and the completed rewatch count sync separately from that flag. Ambiguous transitions are skipped, including a MAL rewatch ending without an increased count when AniList would otherwise increment it.
+
+When adding a MAL entry to AniList, sync looks up its MAL ID directly. A single verified match can be added automatically. Duplicate IDs and same-title suggestions without a verified match are reported for review.
+
+If either service returns an incomplete list page or chunk, the run stops before planning or writing any changes. Individual titles without a safe match are skipped, and the rest of a run can continue.
+
+The MAL list reader includes all ratings so titles hidden by MAL's default API filter are still recognized as entries you already have.
+
+Private AniList entries are excluded from sync in both directions. If AniList omits an entry's privacy setting, that entry is skipped as well. The app never copies private notes into a preview or new sync history.
+
+With `sync.score_sync_mode: auto`, fractional AniList scores are compared at MAL's whole-number precision. When the scores are equivalent at that precision, an update to another field preserves the finer AniList score. Set `sync.score_sync_mode: disabled` to keep ratings independent, including for newly added titles.
+
+Start and finish dates sync by default. Bidirectional sync fills in a missing date from the other service and keeps year-only and year/month precision. Once both sides have agreed on a date, a clear on one side can sync too. Conflicting dates, unsupported date formats, and changes that would place a start after its finish are reported instead of written.
 
 Sync runs use an OS-backed lock in the configured token directory, preventing separate local processes that share that directory from syncing at the same time. AniList and MAL do not provide conditional list writes here, so an external edit made after the lists are fetched can still race with a pending update.
 
@@ -307,7 +325,7 @@ flowchart TD
     TokenLoad --> TokensFound{Tokens found?}
     
     TokensFound -->|Yes| CheckExpired{Token expired?}
-    TokensFound -->|No| AutoAuth[Auto-authenticate authenticate_services]
+    TokensFound -->|No| AutoAuth[Authorize services with missing tokens]
     
     AutoAuth -->|Success| TokenReady
     AutoAuth -->|Fail| ExitAuth[EXIT or Continue Loop]

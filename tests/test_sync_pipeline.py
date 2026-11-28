@@ -69,12 +69,15 @@ class FakeClient:
     def get_user_anime_list(self, username=None):
         return list(self.entries)
 
-    def update_anime(self, anime_entry):
+    def update_anime(self, anime_entry, *, fields=None):
         self.updates.append(anime_entry)
         return self.update_result
 
     def search_anime(self, title, limit=5):
         return self.search_results[:limit]
+
+    def find_anime_by_mal_id(self, mal_id):
+        return [item for item in self.search_results if item.get("idMal") == mal_id]
 
 
 def test_dry_run_emits_stable_structured_diff_without_writes(tmp_path, monkeypatch):
@@ -321,7 +324,7 @@ def test_anilist_search_failure_is_counted_not_reported_as_no_match(tmp_path, mo
     assert anilist.updates == []
 
 
-def test_mal_only_entry_is_matched_to_unique_exact_anilist_title(tmp_path, monkeypatch):
+def test_title_only_anilist_candidate_is_reported_for_review(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "anilist_mal_sync.sync_engine.get_settings",
         lambda: settings(tmp_path),
@@ -338,14 +341,13 @@ def test_mal_only_entry_is_matched_to_unique_exact_anilist_title(tmp_path, monke
         settings=settings(tmp_path),
     ).sync("bidirectional")
 
-    assert len(result.additions) == 1
-    assert result.additions[0].source == "mal"
-    assert result.additions[0].anilist_id == 70
+    assert result.additions == []
+    assert "AniList ID 70" in result.skipped_conflicts[0].reason
     assert anilist.updates == []
     assert mal.updates == []
 
 
-def test_anilist_search_prefers_matching_mal_id_over_same_title(tmp_path, monkeypatch):
+def test_anilist_direct_mal_id_lookup_ignores_different_titles(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "anilist_mal_sync.sync_engine.get_settings",
         lambda: settings(tmp_path),
@@ -367,6 +369,20 @@ def test_anilist_search_prefers_matching_mal_id_over_same_title(tmp_path, monkey
 
     assert len(result.additions) == 1
     assert result.additions[0].anilist_id == 71
+
+
+def test_anilist_direct_lookup_filters_by_mal_id(monkeypatch, tmp_path):
+    client = AniListClient("test-token", settings=settings(tmp_path))
+    matches = [{"id": 456, "idMal": 123}, {"id": 789, "idMal": 123}]
+
+    def query(document, variables):
+        assert "media(idMal: $malId, type: ANIME)" in document
+        assert "Page(perPage: 2)" in document
+        assert variables == {"malId": 123}
+        return {"Page": {"media": matches}}
+
+    monkeypatch.setattr(client, "_query", query)
+    assert client.find_anime_by_mal_id(123) == matches
 
 
 def test_anilist_search_rejects_exact_title_with_conflicting_mal_id(
@@ -392,7 +408,7 @@ def test_anilist_search_rejects_exact_title_with_conflicting_mal_id(
 
     assert result.additions == []
     assert len(result.skipped) == 1
-    assert result.skipped[0].reason == "no exact AniList title match"
+    assert result.skipped[0].reason == "no AniList entry for MAL ID 701 or exact title suggestion"
 
 
 def test_mal_rate_limit_429_retries_then_completes():
@@ -407,7 +423,8 @@ def test_mal_rate_limit_429_retries_then_completes():
                 self.send_header("Retry-After", "0")
                 self.end_headers()
                 return
-            body = json.dumps({"data": [], "paging": {}}).encode()
+            payload = {"name": "tester"} if self.path == "/users/@me" else {"data": [], "paging": {}}
+            body = json.dumps(payload).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -421,10 +438,10 @@ def test_mal_rate_limit_429_retries_then_completes():
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        client = MALClient("test-token", settings=SimpleNamespace(score_sync_mode="auto"))
+        client = MALClient("test-token", settings=SimpleNamespace(score_sync_mode="auto", mal_username="tester"))
         client.base_url = f"http://127.0.0.1:{server.server_port}"
         assert client.get_user_anime_list() == []
-        assert request_count == 2
+        assert request_count == 3
     finally:
         server.shutdown()
         thread.join(timeout=2)
@@ -437,6 +454,7 @@ def test_anilist_rate_limit_429_retries_graphql_post():
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             nonlocal request_count
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
             request_count += 1
             if request_count == 1:
                 self.send_response(429)
@@ -473,7 +491,7 @@ def test_anilist_write_uses_raw_100_point_score(monkeypatch):
 
     def capture_mutation(query, variables=None):
         captured.update(query=query, variables=variables)
-        return {}
+        return {"SaveMediaListEntry": {"id": 1}}
 
     monkeypatch.setattr(client, "_query", capture_mutation)
 
@@ -481,6 +499,12 @@ def test_anilist_write_uses_raw_100_point_score(monkeypatch):
     assert captured["variables"]["scoreRaw"] == 85
     assert "scoreRaw: $scoreRaw" in captured["query"]
     assert "score: $score" not in captured["query"]
+
+
+def test_anilist_write_requires_confirmation(monkeypatch, tmp_path):
+    client = AniListClient("fixture-token", settings(tmp_path))
+    monkeypatch.setattr(client, "_query", lambda *args: {"SaveMediaListEntry": None})
+    assert not client.update_anime(entry(7, anilist_id=70), fields=["episodes_watched"])
 
 
 def test_auth_error_during_sync_refreshes_mal_and_restarts_from_fresh_lists(
@@ -507,7 +531,7 @@ def test_auth_error_during_sync_refreshes_mal_and_restarts_from_fresh_lists(
             mal_tokens.append(access_token)
             self.entries = mal_entries
 
-        def update_anime(self, anime_entry):
+        def update_anime(self, anime_entry, *, fields=None):
             nonlocal fail_second_entry_once
             self.updates.append(anime_entry)
             update_ids.append(anime_entry.mal_id)
@@ -559,10 +583,10 @@ def test_anilist_auth_error_reauthenticates_only_anilist_and_restarts(tmp_path, 
             super().__init__()
             anilist_tokens.append(access_token)
 
-        def search_anime(self, title, limit=5):
-            return [{"id": 70, "title": {"english": title}}]
+        def find_anime_by_mal_id(self, mal_id):
+            return [{"id": 70, "idMal": mal_id}]
 
-        def update_anime(self, anime_entry):
+        def update_anime(self, anime_entry, *, fields=None):
             nonlocal fail_once
             self.updates.append(anime_entry)
             if fail_once:
@@ -638,29 +662,497 @@ def test_sync_lock_prevents_overlapping_process_runs(tmp_path):
 
 
 def test_dry_run_serialization_is_deterministic(monkeypatch):
-    result = SyncResult(success=True, dry_run=True)
+    result = SyncResult(success=True, dry_run=True, errors=["Title Ω"])
     output = []
-    monkeypatch.setattr("anilist_mal_sync.sync_service.click.echo", output.append)
+    monkeypatch.setattr(
+        "anilist_mal_sync.sync_service.click.echo",
+        lambda message: output.append(message.encode("cp1252")),
+    )
     print_sync_results(result, "bidirectional")
     print_sync_results(result, "bidirectional")
 
     assert output[0] == output[1]
+    assert json.loads(output[0])["errors"] == ["Title Ω"]
 
 
 def test_cli_dry_run_flag_requests_plan_and_prints_json(monkeypatch):
-    config = SimpleNamespace(dry_run=False, log_level="INFO")
+    config = SimpleNamespace(dry_run=False, log_level="INFO", sync_mode="bidirectional")
     calls = {}
     monkeypatch.setattr(cli, "get_settings", lambda: config)
     monkeypatch.setattr(cli, "setup_logging", lambda level: None)
     monkeypatch.setattr(cli, "_wait_for_valid_config", lambda path=None: None)
 
-    def fake_execute_sync(mode, dry_run, settings=None):
-        calls.update(mode=mode, dry_run=dry_run, settings=settings)
+    def fake_execute_sync(mode, dry_run, settings=None, mal_ids=frozenset()):
+        calls.update(mode=mode, dry_run=dry_run, settings=settings, mal_ids=mal_ids)
         return True, SyncResult(success=True, dry_run=dry_run)
 
     monkeypatch.setattr(cli, "execute_sync", fake_execute_sync)
-    result = CliRunner().invoke(cli.main, ["run", "--once", "--dry-run"])
+    result = CliRunner().invoke(cli.main, ["run", "--once", "--dry-run", "--mal-id", "7"])
 
     assert result.exit_code == 0, result.output
     assert calls["dry_run"] is True
+    assert calls["mal_ids"] == frozenset({7})
     assert json.loads(result.output)["dry_run"] is True
+
+
+@pytest.mark.parametrize(
+    ("source", "mode"),
+    [("anilist", "anilist-to-mal"), ("mal", "mal-to-anilist"), ("mal", "bidirectional")],
+)
+def test_active_rewatch_is_reported_without_writes(tmp_path, source, mode):
+    anilist_entry = entry(7, anilist_id=70)
+    mal_entry = entry(7)
+    active_entry = anilist_entry if source == "anilist" else mal_entry
+    active_entry.is_rewatching = True
+    anilist = FakeClient([anilist_entry])
+    mal = FakeClient([mal_entry])
+
+    result = SyncEngine(anilist, mal, settings=settings(tmp_path)).sync(mode)
+
+    assert result.entries_synced == 0
+    assert result.skipped_conflicts[0].reason == "active rewatch has an unsupported base status"
+    assert anilist.updates == mal.updates == []
+
+
+def test_anilist_rejects_account_mismatch_before_reading_list(tmp_path, monkeypatch):
+    client = AniListClient("token", settings=settings(tmp_path))
+    queries = []
+
+    def query(document, variables=None):
+        queries.append(document)
+        return {"Viewer": {"name": "different-user"}}
+
+    monkeypatch.setattr(client, "_query", query)
+    with pytest.raises(ValueError, match="belongs to different-user"):
+        client.get_user_anime_list("expected-user")
+    assert queries == ["query { Viewer { id name } }"]
+
+
+def test_anilist_note_update_does_not_send_score_or_progress(tmp_path, monkeypatch):
+    client = AniListClient("token", settings=settings(tmp_path))
+    captured = {}
+
+    def capture(document, variables):
+        captured.update(variables)
+        return {"SaveMediaListEntry": {"id": 1}}
+
+    monkeypatch.setattr(client, "_query", capture)
+    assert client.update_anime(entry(7, anilist_id=70), fields=["notes"])
+    assert captured == {"mediaId": 70, "notes": ""}
+
+
+def test_bidirectional_history_merges_independent_fields_and_suppresses_readdition(tmp_path):
+    class ApplyingClient(FakeClient):
+        def update_anime(self, anime_entry, *, fields=None):
+            success = super().update_anime(anime_entry, fields=fields)
+            for field in fields:
+                setattr(self.entries[0], field, getattr(anime_entry, field))
+            return success
+
+    anilist = ApplyingClient([entry(7, anilist_id=70, episodes=2)])
+    mal = ApplyingClient([entry(7, episodes=2)])
+    anilist.account_key, mal.account_key = "1", "2"
+
+    def sync(dry_run=False):
+        return SyncEngine(
+            anilist, mal, dry_run=dry_run, settings=settings(tmp_path),
+            history_directory=tmp_path,
+        ).sync("bidirectional")
+
+    assert sync().entries_synced == 0
+    anilist.entries[0].episodes_watched = 3
+    mal.entries[0].notes = "MAL edit"
+    preview = sync(dry_run=True)
+    assert [(change.target, change.fields) for change in preview.updates] == [
+        ("mal", ["episodes_watched"]), ("anilist", ["notes"]),
+    ]
+    assert sync().entries_synced == 2
+    assert anilist.entries[0].notes == mal.entries[0].notes == "MAL edit"
+    assert anilist.entries[0].episodes_watched == mal.entries[0].episodes_watched == 3
+    assert sync().planned_changes == 0
+    mal.entries.clear()
+    result = sync()
+    assert result.additions == []
+    assert "disappeared" in result.skipped_conflicts[0].reason
+
+
+def test_mal_incomplete_second_page_aborts_before_list_is_used(tmp_path, monkeypatch):
+    config = settings(tmp_path)
+    config.mal_username = ""
+    client = MALClient("token", settings=config)
+    pages = iter([
+        {"name": "tester"},
+        {"data": [], "paging": {"next": client.base_url + "/users/@me/animelist?offset=1000"}},
+        {"paging": {}},
+    ])
+
+    list_requests = []
+
+    def get(url, **kwargs):
+        if "/animelist" in url:
+            list_requests.append(kwargs["params"])
+        payload = next(pages)
+        return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: payload)
+
+    monkeypatch.setattr(client.session, "get", get)
+    with pytest.raises(ValueError, match="incomplete anime list page"):
+        client.get_user_anime_list()
+    assert list_requests[0]["nsfw"] == "true"
+    assert list_requests[1]["nsfw"] == "true"
+    assert list_requests[1]["fields"] == list_requests[0]["fields"]
+
+
+def test_anilist_missing_page_metadata_aborts_before_list_is_used(tmp_path, monkeypatch):
+    client = AniListClient("token", settings=settings(tmp_path))
+    pages = iter([
+        {"Viewer": {"id": 1, "name": "tester"}},
+        {"MediaListCollection": {"lists": [], "hasNextChunk": True}},
+        {"MediaListCollection": {"lists": []}},
+    ])
+    monkeypatch.setattr(client, "_query", lambda *args: next(pages))
+    with pytest.raises(ValueError, match="incomplete anime list chunk"):
+        client.get_user_anime_list()
+
+
+@pytest.mark.parametrize("mode", ["anilist-to-mal", "bidirectional"])
+def test_targeted_sync_does_not_write_other_titles(tmp_path, mode):
+    anilist = FakeClient([entry(7, anilist_id=70), entry(8, anilist_id=80)])
+    mal = FakeClient()
+    result = SyncEngine(
+        anilist, mal, settings=settings(tmp_path), mal_ids=frozenset({7}),
+    ).sync(mode)
+    assert result.entries_synced == 1
+    assert [updated.mal_id for updated in mal.updates] == [7]
+
+
+def test_readiness_reports_only_service_still_needing_authorization(tmp_path, monkeypatch):
+    config = settings(tmp_path)
+
+    def authorize(service, settings, token_manager):
+        if service == "anilist":
+            token_manager.set_tokens(service, "fixture-token", expires_in=3600)
+            return True
+        return False
+
+    monkeypatch.setattr("anilist_mal_sync.sync_service.run_oauth_flow", authorize)
+    completed, result = execute_sync("bidirectional", dry_run=True, settings=config)
+    assert not completed
+    assert result.authentication_required == ["mal"]
+
+
+@pytest.mark.parametrize(("anilist_status", "mal_status"), [
+    ("CURRENT", "watching"),
+    ("COMPLETED", "completed"),
+    ("PAUSED", "on_hold"),
+    ("DROPPED", "dropped"),
+    ("PLANNING", "plan_to_watch"),
+])
+def test_watch_status_round_trip(tmp_path, monkeypatch, anilist_status, mal_status):
+    config = settings(tmp_path)
+    anilist = AniListClient("fixture-token", config)
+    mal = MALClient("fixture-token", config)
+    al_entry = anilist._parse_entry({
+        "status": anilist_status, "private": False,
+        "media": {"id": 70, "idMal": 7, "title": {"english": "Test"}},
+    })
+    mal_entry = mal._parse_entry({
+        "list_status": {"status": mal_status}, "node": {"id": 7, "title": "Test"},
+    }).model_copy(update={"anilist_id": 70})
+    assert al_entry.status == mal_entry.status
+
+    def mutate_anilist(document, variables):
+        assert variables["status"] == anilist_status
+        return {"SaveMediaListEntry": {"id": 1}}
+
+    def patch_mal(url, *, data, **kwargs):
+        assert data["status"] == mal_status
+        return SimpleNamespace(status_code=200, raise_for_status=lambda: None)
+
+    monkeypatch.setattr(anilist, "_query", mutate_anilist)
+    monkeypatch.setattr(mal.session, "patch", patch_mal)
+    assert anilist.update_anime(mal_entry, fields=["status"])
+    assert mal.update_anime(al_entry, fields=["status"])
+
+
+def test_real_clients_round_trip_supported_fields_and_settle(tmp_path, monkeypatch):
+    config = settings(tmp_path)
+    config.mal_username = ""
+    anilist = AniListClient("fixture-token", config)
+    mal = MALClient("fixture-token", config)
+    al_state = {
+        "id": 1, "status": "CURRENT", "progress": 2, "score": 8.6, "notes": "Test Ω",
+        "private": False,
+        "startedAt": {"year": None, "month": None, "day": None},
+        "completedAt": {"year": None, "month": None, "day": None},
+        "repeat": 1, "media": {"id": 70, "idMal": 7, "title": {"english": "Test"}},
+    }
+    mal_state = {
+        "status": "plan_to_watch", "num_episodes_watched": 0, "score": 0,
+        "comments": "", "num_times_rewatched": 0, "is_rewatching": False,
+    }
+    writes = []
+
+    def response(payload):
+        return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: payload)
+
+    def graphql(url, *, json, **kwargs):
+        document = json["query"]
+        if "Viewer" in document:
+            return response({"data": {"Viewer": {"id": 11, "name": "test-user"}}})
+        if "MediaListCollection" in document:
+            assert "private" in document
+            return response({"data": {"MediaListCollection": {
+                "lists": [{"entries": [al_state]}], "hasNextChunk": False,
+            }}})
+        assert "SaveMediaListEntry" in document
+        values = json["variables"].copy()
+        assert values.pop("mediaId") == 70
+        if "scoreRaw" in values:
+            values["score"] = values.pop("scoreRaw") / 10
+        al_state.update(values)
+        writes.append("anilist")
+        return response({"data": {"SaveMediaListEntry": {"id": 1}}})
+
+    def mal_get(url, **kwargs):
+        if url.endswith("/users/@me"):
+            return response({"id": 22, "name": "mal-tester"})
+        assert url.endswith("/users/@me/animelist")
+        return response({"data": [{"node": {"id": 7, "title": "Test"}, "list_status": mal_state}], "paging": {}})
+
+    def mal_patch(url, *, data, **kwargs):
+        assert url.endswith("/anime/7/my_list_status")
+        values = data.copy()
+        if "num_watched_episodes" in values:
+            values["num_episodes_watched"] = values.pop("num_watched_episodes")
+        mal_state.update(values)
+        writes.append("mal")
+        return response(mal_state)
+
+    monkeypatch.setattr(anilist.session, "post", graphql)
+    monkeypatch.setattr(mal.session, "get", mal_get)
+    monkeypatch.setattr(mal.session, "patch", mal_patch)
+    engine = SyncEngine(anilist, mal, settings=config, history_directory=tmp_path)
+
+    assert engine.sync("anilist-to-mal").entries_synced == 1
+    assert mal_state == {
+        "status": "watching", "num_episodes_watched": 2, "score": 9,
+        "comments": "Test Ω", "num_times_rewatched": 1, "is_rewatching": False,
+    }
+    assert engine.sync("bidirectional").planned_changes == 0
+    assert al_state["score"] == 8.6
+
+    mal_state.update(status="on_hold", num_episodes_watched=3, score=7, comments="", num_times_rewatched=2)
+    assert engine.sync("bidirectional").entries_synced == 1
+    assert {key: al_state[key] for key in ("status", "progress", "score", "notes", "repeat")} == {
+        "status": "PAUSED", "progress": 3, "score": 7, "notes": "", "repeat": 2,
+    }
+    assert engine.sync("bidirectional").planned_changes == 0
+    assert writes == ["mal", "anilist"]
+
+
+def test_bidirectional_rewatch_start_uses_status_progress_and_count(tmp_path):
+    completed = WatchStatus.COMPLETED
+    anilist = FakeClient([entry(7, anilist_id=70, status=completed, episodes=5)])
+    mal = FakeClient([entry(7, status=completed, episodes=5)])
+    anilist.account_key, mal.account_key = "11", "22"
+    engine = SyncEngine(anilist, mal, settings=settings(tmp_path), history_directory=tmp_path)
+    assert engine.sync("bidirectional").planned_changes == 0
+
+    anilist.entries[0].is_rewatching = True
+    anilist.entries[0].episodes_watched = 1
+    result = engine.sync("bidirectional")
+    assert result.entries_synced == 1
+    assert result.updates[0].fields == ["status", "is_rewatching", "episodes_watched", "rewatched"]
+    assert mal.updates[0].is_rewatching
+
+
+def test_rewatch_transition_conflicts_with_other_side_progress_edit(tmp_path):
+    completed = WatchStatus.COMPLETED
+    anilist = FakeClient([entry(7, anilist_id=70, status=completed, episodes=5)])
+    mal = FakeClient([entry(7, status=completed, episodes=5)])
+    anilist.account_key, mal.account_key = "11", "22"
+    engine = SyncEngine(anilist, mal, settings=settings(tmp_path), history_directory=tmp_path)
+    assert engine.sync("bidirectional").planned_changes == 0
+
+    anilist.entries[0].is_rewatching = True
+    anilist.entries[0].episodes_watched = 1
+    mal.entries[0].episodes_watched = 4
+    result = engine.sync("bidirectional")
+    assert result.planned_changes == 0
+    assert result.skipped_conflicts[0].fields == ["is_rewatching", "episodes_watched"]
+    assert not anilist.updates and not mal.updates
+
+
+def test_mal_finish_without_increased_count_is_not_written_to_anilist(tmp_path):
+    completed = WatchStatus.COMPLETED
+    al_entry = entry(7, anilist_id=70, status=completed, episodes=2)
+    al_entry.is_rewatching = True
+    anilist = FakeClient([al_entry])
+    mal = FakeClient([entry(7, status=completed, episodes=5)])
+    engine = SyncEngine(anilist, mal, settings=settings(tmp_path))
+    result = engine.sync("mal-to-anilist")
+    assert not anilist.updates
+    assert "without an increased count" in result.skipped_conflicts[0].reason
+
+    mal.entries[0].rewatched = 1
+    result = engine.sync("mal-to-anilist")
+    assert result.entries_synced == 1
+    assert result.updates[0].fields == ["status", "is_rewatching", "episodes_watched", "rewatched"]
+    assert anilist.updates[0].rewatched == 1
+
+
+@pytest.mark.parametrize(("mode", "has_mal_entry"), [
+    ("anilist-to-mal", False), ("anilist-to-mal", True),
+    ("mal-to-anilist", True), ("bidirectional", False), ("bidirectional", True),
+])
+@pytest.mark.parametrize("visibility", [True, None])
+def test_private_or_unknown_anilist_entries_never_write(tmp_path, mode, has_mal_entry, visibility):
+    client = AniListClient("fixture-token", settings(tmp_path))
+    payload = {
+        "status": "CURRENT", "notes": "Private note",
+        "media": {"id": 70, "idMal": 7, "title": {"english": "Test"}},
+    }
+    if visibility is True:
+        payload["private"] = True
+    anilist = FakeClient([client._parse_entry(payload)])
+    mal = FakeClient([entry(7)] if has_mal_entry else [])
+    for dry_run in (False, True):
+        result = SyncEngine(anilist, mal, settings=settings(tmp_path), dry_run=dry_run).sync(mode)
+        assert result.planned_changes == 0
+        assert result.skipped_conflicts[0].reason in {
+            "private AniList entry", "AniList entry visibility unavailable",
+        }
+        assert "Private note" not in result.model_dump_json()
+    assert not anilist.updates and not mal.updates
+
+
+def test_bidirectional_private_entry_discards_previously_agreed_notes(tmp_path):
+    anilist = FakeClient([entry(7, anilist_id=70)])
+    mal = FakeClient([entry(7)])
+    anilist.account_key, mal.account_key = "11", "22"
+    anilist.entries[0].notes = mal.entries[0].notes = "Formerly public note"
+    engine = SyncEngine(anilist, mal, settings=settings(tmp_path), history_directory=tmp_path)
+    assert engine.sync("bidirectional").planned_changes == 0
+    history_file = next(tmp_path.glob("sync-history-*.json"))
+    assert "Formerly public note" in history_file.read_text()
+
+    anilist.entries[0].is_private = True
+    assert engine.sync("bidirectional").skipped_conflicts[0].reason == "private AniList entry"
+    entries = json.loads(history_file.read_text())["entries"]
+    assert entries == {"7": {}}
+
+
+def test_disabling_score_sync_omits_ratings_from_both_api_payloads(tmp_path, monkeypatch):
+    config = settings(tmp_path, score_sync_mode="disabled")
+    anilist = AniListClient("fixture-token", config)
+    mal = MALClient("fixture-token", config)
+    anime = entry(7, anilist_id=70, score=8.6)
+
+    def mutate_anilist(document, variables):
+        assert "scoreRaw" not in document
+        assert "scoreRaw" not in variables
+        return {"SaveMediaListEntry": {"id": 1}}
+
+    def patch_mal(url, *, data, **kwargs):
+        assert "score" not in data
+        return SimpleNamespace(status_code=200, raise_for_status=lambda: None)
+
+    monkeypatch.setattr(anilist, "_query", mutate_anilist)
+    monkeypatch.setattr(mal.session, "patch", patch_mal)
+    assert anilist.update_anime(anime)
+    assert mal.update_anime(anime)
+
+    source = FakeClient([anime])
+    target = FakeClient([entry(7, score=4, episodes=0)])
+    plan = SyncEngine(source, target, settings=config, dry_run=True).sync("anilist-to-mal")
+    assert plan.updates[0].fields == ["episodes_watched"]
+
+
+def test_bidirectional_watch_dates_fill_blanks_and_follow_confirmed_edits(tmp_path):
+    al_entry, mal_entry = entry(7, anilist_id=70), entry(7)
+    al_entry.start_date = "2024-02"
+    mal_entry.finish_date = "2024-03-01"
+    anilist, mal = FakeClient([al_entry]), FakeClient([mal_entry])
+    anilist.account_key, mal.account_key = "11", "22"
+    engine = SyncEngine(anilist, mal, settings=settings(tmp_path), history_directory=tmp_path)
+    result = engine.sync("bidirectional")
+    assert [(item.target, item.fields) for item in result.updates] == [
+        ("mal", ["start_date"]), ("anilist", ["finish_date"]),
+    ]
+    assert not result.skipped_conflicts
+
+    # Simulate both services returning the writes, then one side clearing an agreed date.
+    mal_entry.start_date = "2024-02"
+    al_entry.finish_date = "2024-03-01"
+    assert engine.sync("bidirectional").planned_changes == 0
+    mal_entry.finish_date = None
+    result = engine.sync("bidirectional")
+    assert result.updates[0].target == "anilist"
+    assert result.updates[0].differences == {"finish_date": {"from": "2024-03-01", "to": None}}
+
+
+@pytest.mark.parametrize(("mal_start", "mal_finish", "expected"), [
+    ("2024-02-02", None, "watch dates disagree"),
+    (None, "2023-12", "start after the finish"),
+])
+def test_watch_date_conflicts_are_never_written(tmp_path, mal_start, mal_finish, expected):
+    a, m = entry(7, anilist_id=70), entry(7)
+    a.start_date = "2024-02-01"
+    if mal_finish:
+        a.finish_date = mal_finish
+    m.start_date, m.finish_date = mal_start, mal_finish
+    anilist, mal = FakeClient([a]), FakeClient([m])
+    anilist.account_key, mal.account_key = "11", "22"
+    result = SyncEngine(
+        anilist, mal, settings=settings(tmp_path), history_directory=tmp_path,
+    ).sync("bidirectional")
+    assert result.planned_changes == 0
+    assert expected in result.skipped_conflicts[0].reason
+    assert not anilist.updates and not mal.updates
+
+
+def test_watch_date_requests_preserve_partial_precision_and_explicit_clear(tmp_path, monkeypatch):
+    config = settings(tmp_path)
+    anilist, mal = AniListClient("fixture-token", config), MALClient("fixture-token", config)
+    anime = anilist._parse_entry({
+        "status": "CURRENT", "private": False, "startedAt": {"year": 2024, "month": 2, "day": None},
+        "completedAt": {"year": None, "month": None, "day": None},
+        "media": {"id": 70, "idMal": 7, "title": {"english": "Test"}},
+    })
+    assert (anime.start_date, anime.finish_date) == ("2024-02", None)
+
+    def mutate(document, variables):
+        assert variables == {
+            "mediaId": 70, "startedAt": {"year": 2024, "month": 2, "day": None},
+            "completedAt": {"year": None, "month": None, "day": None},
+        }
+        return {"SaveMediaListEntry": {"id": 1}}
+
+    def patch(url, *, data, **kwargs):
+        assert data == {"start_date": "2024-02", "finish_date": ""}
+        return SimpleNamespace(status_code=200, raise_for_status=lambda: None)
+
+    monkeypatch.setattr(anilist, "_query", mutate)
+    monkeypatch.setattr(mal.session, "patch", patch)
+    fields = ["start_date", "finish_date"]
+    assert anilist.update_anime(anime, fields=fields)
+    assert mal.update_anime(anime, fields=fields)
+    invalid = anilist._parse_entry({
+        "status": "CURRENT", "private": False, "startedAt": {"month": 2},
+        "media": {"id": 70, "idMal": 7, "title": {"english": "Test"}},
+    })
+    assert invalid.unavailable_dates == {"start_date", "finish_date"}
+
+
+def test_matching_partial_watch_date_is_upgraded_without_guessing(tmp_path):
+    a, m = entry(7, anilist_id=70), entry(7)
+    a.start_date, m.start_date = "2024", "2024-02-29"
+    anilist, mal = FakeClient([a]), FakeClient([m])
+    anilist.account_key, mal.account_key = "11", "22"
+    result = SyncEngine(
+        anilist, mal, settings=settings(tmp_path), history_directory=tmp_path,
+    ).sync("bidirectional")
+    assert result.updates[0].target == "anilist"
+    assert result.updates[0].differences == {
+        "start_date": {"from": "2024", "to": "2024-02-29"},
+    }

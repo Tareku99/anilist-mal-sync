@@ -4,7 +4,7 @@ import logging
 import os
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import yaml
 from pydantic import BaseModel, Field, field_validator
@@ -26,10 +26,8 @@ INVALID_PLACEHOLDERS = {
 REQUIRED_VARS = [
     "ANILIST_CLIENT_ID",
     "ANILIST_CLIENT_SECRET",
-    "ANILIST_USERNAME",
     "MAL_CLIENT_ID",
     "MAL_CLIENT_SECRET",
-    "MAL_USERNAME",
 ]
 
 
@@ -59,8 +57,8 @@ class MALConfig(BaseModel):
 
 class SyncConfig(BaseModel):
     """Synchronization settings."""
-    mode: str = "bidirectional"
-    score_sync_mode: str = "auto"
+    mode: Literal["anilist-to-mal", "mal-to-anilist", "bidirectional"] = "bidirectional"
+    score_sync_mode: Literal["auto", "disabled"] = "auto"
     interval: int = Field(default=360, ge=1)
     dry_run: bool = False
     log_level: str = "INFO"

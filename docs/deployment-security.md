@@ -74,6 +74,7 @@ When deploying or using this project:
   - `18080` (OAuth callback) - should only be accessible during setup
 
 ### Web UI Security
-- **No Authentication**: The web UI (port 23080) currently has no authentication - restrict network access
-- **Local Access Only**: Recommended to only expose on localhost or use a reverse proxy with authentication
+- **Local Access**: The example Compose file publishes the dashboard on localhost.
+- **LAN or Unraid Access**: Set **Dashboard Password** in the Unraid template or set `SYNC_DASHBOARD_PASSWORD` in the container environment to require HTTP Basic authentication. Sign in as `admin`. Use a reverse proxy with HTTPS before using this password over the network, or keep access behind a trusted VPN.
+- **Configuration Secrets**: The dashboard masks stored client secrets. Leave the placeholder in place to preserve the saved secret, or replace it with the new value when rotating credentials.
 - **Configuration Editing**: The web UI can edit `config.yaml` - ensure proper access controls

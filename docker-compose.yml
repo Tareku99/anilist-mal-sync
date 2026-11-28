@@ -7,12 +7,12 @@ services:
       - ./data:/app/data
     ports:
       - "18080:18080"  # OAuth callback port
-      - "23080:23080"  # Web UI port
+      - "127.0.0.1:23080:23080"  # Web UI on this host
     environment:
       - TZ=America/Boise  # Change to your timezone (e.g., America/New_York, Europe/London)
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-m", "anilist_mal_sync.healthcheck"]
+      test: ["CMD", "python", "-m", "anilist_mal_sync.healthcheck", "--liveness"]
       interval: 5m
       timeout: 10s
       start_period: 10s
